@@ -1,0 +1,668 @@
+import "@testing-library/jest-dom";
+import { beforeEach, describe, expect, it, jest } from "@jest/globals";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+
+const mockSendToolApproval = jest.fn(() => Promise.resolve());
+const mockOnRetryConnection = jest.fn();
+const mockOnStop = jest.fn();
+let mockSession: {
+  chatId: string;
+  sessionId: string;
+  publicAccessToken: string;
+} | null;
+
+jest.mock("@/app/contexts/AgentApprovalContext", () => ({
+  useAgentApproval: () => ({
+    session: mockSession,
+    sendToolApproval: mockSendToolApproval,
+    toolApprovalSendStates: {},
+  }),
+}));
+
+const { AgentApprovalPrompt, getApprovalPurpose } = jest.requireActual<
+  typeof import("../AgentApprovalPrompt")
+>("../AgentApprovalPrompt");
+
+const request = {
+  approvalId: "approval-1",
+  toolCallId: "tool-1",
+  title: "Allow HackerAI to run this terminal command?",
+  target: "ping -c 4 hackerone.com",
+  justification: "Check whether the target host is reachable.",
+  prefixRule: ["ping", "-c", "4"],
+  detail: "Approve to continue, or deny to stop this command.",
+  kind: "terminal" as const,
+  operation: "terminal_execute" as const,
+};
+
+const renderPrompt = (props?: { hasConnectionError?: boolean }) =>
+  render(
+    <AgentApprovalPrompt
+      request={request}
+      hasConnectionError={props?.hasConnectionError}
+      onRetryConnection={mockOnRetryConnection}
+      onStop={mockOnStop}
+    />,
+  );
+
+describe("AgentApprovalPrompt", () => {
+  beforeEach(() => {
+    mockSendToolApproval.mockClear();
+    mockOnRetryConnection.mockClear();
+    mockOnStop.mockClear();
+    mockSession = {
+      chatId: "approval-chat",
+      sessionId: "agent-approval-session",
+      publicAccessToken: "public-token",
+    };
+  });
+
+  it("renders a compact approval card instead of selectable option rows", () => {
+    renderPrompt();
+
+    expect(screen.getByText("Terminal command")).toBeInTheDocument();
+    expect(screen.getByText(request.title)).toBeInTheDocument();
+    expect(screen.getByText(request.justification)).toBeInTheDocument();
+    expect(screen.getByText(request.target)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Deny" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Allow once" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "More approval options" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("radio")).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+  });
+
+  it("identifies the subagent requesting an action", () => {
+    render(
+      <AgentApprovalPrompt
+        request={{ ...request, sourceAgentName: "Recon worker" }}
+        onRetryConnection={mockOnRetryConnection}
+        onStop={mockOnStop}
+      />,
+    );
+
+    expect(
+      screen.getByText("Recon worker · Terminal command"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the exact action in a readable code block", () => {
+    renderPrompt();
+
+    const target = screen.getByTestId("agent-approval-target");
+    expect(target.tagName).toBe("PRE");
+    expect(target).toHaveAccessibleName("Exact action");
+    expect(target).toHaveTextContent(request.target);
+    expect(target.querySelector("code")).toHaveAttribute("translate", "no");
+  });
+
+  it("omits generic purpose copy that only repeats the command", () => {
+    render(
+      <AgentApprovalPrompt
+        request={{
+          ...request,
+          target: "rm -rf /tmp/dangerous_test_dir",
+          justification: "User requested execution of rm -rf command",
+        }}
+        onRetryConnection={mockOnRetryConnection}
+        onStop={mockOnStop}
+      />,
+    );
+
+    expect(
+      screen.queryByText("User requested execution of rm -rf command"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-approval-target")).toHaveTextContent(
+      "rm -rf /tmp/dangerous_test_dir",
+    );
+  });
+
+  it("keeps purpose copy that explains why the action is needed", () => {
+    expect(
+      getApprovalPurpose({
+        target: "rm -rf /tmp/dangerous_test_dir",
+        justification:
+          "Remove the temporary test directory after verification.",
+      }),
+    ).toBe("Remove the temporary test directory after verification.");
+  });
+
+  it("does not show generic fallback instructions beside an exact action", () => {
+    expect(
+      getApprovalPurpose({
+        target: "pnpm test",
+        detail: "Approve to continue, or deny to stop this command.",
+      }),
+    ).toBe("");
+  });
+
+  it("shows the privacy-safe automatic review summary before human approval", () => {
+    render(
+      <AgentApprovalPrompt
+        request={{
+          ...request,
+          autoReview: {
+            verdict: "deny",
+            riskCategory: "scope_expansion",
+            rationale: "The requested scan exceeds the authorized scope.",
+            rolloutPhase: "enforce",
+          },
+        }}
+        onRetryConnection={mockOnRetryConnection}
+        onStop={mockOnStop}
+      />,
+    );
+
+    expect(screen.getByTestId("agent-auto-review-summary")).toHaveTextContent(
+      "This action needs your approval",
+    );
+    expect(screen.getByTestId("agent-auto-review-summary")).toHaveTextContent(
+      "Risk: scope expansion",
+    );
+    expect(screen.getByTestId("agent-auto-review-summary")).toHaveTextContent(
+      "The requested scan exceeds the authorized scope.",
+    );
+    expect(screen.getByRole("button", { name: "Allow once" })).toBeEnabled();
+  });
+
+  it("uses plain language when automatic review fails closed", () => {
+    render(
+      <AgentApprovalPrompt
+        request={{
+          ...request,
+          autoReview: {
+            verdict: "ask_user",
+            riskCategory: "unknown",
+            rationale: "HackerAI could not review this action in time.",
+            rolloutPhase: "enforce",
+            failureClass: "timeout",
+          },
+        }}
+        onRetryConnection={mockOnRetryConnection}
+        onStop={mockOnStop}
+      />,
+    );
+
+    expect(screen.getByTestId("agent-auto-review-summary")).toHaveTextContent(
+      "Couldn’t approve this automatically",
+    );
+  });
+
+  it("does not reveal a shadow verdict before the human decides", () => {
+    render(
+      <AgentApprovalPrompt
+        request={{
+          ...request,
+          autoReview: {
+            verdict: "approve",
+            riskCategory: "routine",
+            rationale: "The action appears routine.",
+            rolloutPhase: "shadow",
+          },
+        }}
+        onRetryConnection={mockOnRetryConnection}
+        onStop={mockOnStop}
+      />,
+    );
+
+    expect(
+      screen.queryByTestId("agent-auto-review-summary"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("approves once when Enter activates the focused primary action", async () => {
+    const user = userEvent.setup();
+    renderPrompt();
+    const allowButton = screen.getByRole("button", { name: "Allow once" });
+    allowButton.focus();
+
+    await user.keyboard("{Enter}");
+
+    await waitFor(() =>
+      expect(mockSendToolApproval).toHaveBeenCalledWith({
+        approvalId: "approval-1",
+        toolCallId: "tool-1",
+        decision: "approve",
+      }),
+    );
+    expect(allowButton).toHaveFocus();
+  });
+
+  it("does not approve when Enter is pressed on the page body", () => {
+    renderPrompt();
+
+    fireEvent.keyDown(document.body, { key: "Enter", code: "Enter" });
+
+    expect(mockSendToolApproval).not.toHaveBeenCalled();
+  });
+
+  it("approves once from the primary action", async () => {
+    renderPrompt();
+
+    fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
+
+    await waitFor(() =>
+      expect(mockSendToolApproval).toHaveBeenCalledWith({
+        approvalId: "approval-1",
+        toolCallId: "tool-1",
+        decision: "approve",
+      }),
+    );
+  });
+
+  it("approves the validated command prefix for this conversation", async () => {
+    renderPrompt();
+
+    fireEvent.keyDown(
+      screen.getByRole("button", { name: "More approval options" }),
+      { key: "ArrowDown", code: "ArrowDown" },
+    );
+    expect(
+      await screen.findByText(
+        'Commands starting with [\u2068"ping"\u2069,\u2068"-c"\u2069,\u2068"4"\u2069], with any following arguments',
+      ),
+    ).toBeVisible();
+    fireEvent.click(
+      await screen.findByRole("menuitem", {
+        name: 'Allow this conversation: Commands starting with [\u2068"ping"\u2069,\u2068"-c"\u2069,\u2068"4"\u2069], with any following arguments',
+      }),
+    );
+
+    await waitFor(() =>
+      expect(mockSendToolApproval).toHaveBeenCalledWith({
+        approvalId: "approval-1",
+        toolCallId: "tool-1",
+        decision: "approve",
+        grant: "target_prefix",
+        targetKind: "terminal_command",
+        targetPrefix: '["agent-command-prefix-v2",["ping","-c","4"]]',
+      }),
+    );
+  });
+
+  it("keeps argument boundaries explicit without changing the approved argv", async () => {
+    const argv = [
+      "printf",
+      "\u202Eelif--\u202C",
+      "café",
+      "אב",
+      "גד",
+      "two  spaces",
+      "report\u200b\u00a0.txt\u{e0001}",
+    ];
+    render(
+      <AgentApprovalPrompt
+        request={{
+          ...request,
+          target: argv.map((argument) => `'${argument}'`).join(" "),
+          prefixRule: argv,
+        }}
+        onStop={mockOnStop}
+      />,
+    );
+    fireEvent.keyDown(
+      screen.getByRole("button", { name: "More approval options" }),
+      { key: "ArrowDown", code: "ArrowDown" },
+    );
+    const description =
+      'Commands starting with [\u2068"printf"\u2069,\u2068"\\u202eelif--\\u202c"\u2069,\u2068"café"\u2069,\u2068"אב"\u2069,\u2068"גד"\u2069,\u2068"two  spaces"\u2069,\u2068"report\\u200b\\u00a0.txt\\udb40\\udc01"\u2069], with any following arguments';
+    expect(
+      await screen.findByText(description, { normalizer: (text) => text }),
+    ).toBeVisible();
+    const option = screen.getByRole("menuitem", {
+      name: /^Allow this conversation:/,
+    });
+    expect(option).toHaveAttribute("translate", "no");
+    expect(option).toHaveAttribute(
+      "aria-label",
+      `Allow this conversation: ${description}`,
+    );
+    fireEvent.click(option);
+    await waitFor(() =>
+      expect(mockSendToolApproval).toHaveBeenCalledWith({
+        approvalId: "approval-1",
+        toolCallId: "tool-1",
+        decision: "approve",
+        grant: "target_prefix",
+        targetKind: "terminal_command",
+        targetPrefix: JSON.stringify(["agent-command-prefix-v2", argv]),
+      }),
+    );
+  });
+
+  it("reviews the complete long scope before submitting unchanged reusable authority", async () => {
+    const user = userEvent.setup();
+    const argument = `start-${"x".repeat(5000)}-end`;
+    const argv = ["printf", argument];
+    render(
+      <AgentApprovalPrompt
+        request={{
+          ...request,
+          target: `printf '${argument}'`,
+          prefixRule: argv,
+        }}
+        onStop={mockOnStop}
+      />,
+    );
+    const openMenu = () =>
+      fireEvent.keyDown(
+        screen.getByRole("button", { name: "More approval options" }),
+        { key: "ArrowDown" },
+      );
+    openMenu();
+    const menu = await screen.findByRole("menu");
+    expect(menu.textContent).not.toContain(argument);
+    expect(
+      within(menu).getByText(
+        "Command prefix with 2 arguments. Additional arguments allowed.",
+      ),
+    ).toBeVisible();
+    await user.click(
+      within(menu).getByRole("menuitem", { name: "View full scope" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Review approval scope",
+    });
+    const fullScope = within(dialog).getByLabelText("Full approval scope");
+    expect(fullScope.textContent).toContain(argument);
+    expect(fullScope).toHaveAttribute("translate", "no");
+    expect(fullScope).toHaveFocus();
+    expect(mockSendToolApproval).not.toHaveBeenCalled();
+    await user.keyboard("{Escape}");
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+    expect(mockSendToolApproval).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: "More approval options" }),
+    ).toHaveFocus();
+    openMenu();
+    await user.click(
+      await screen.findByRole("menuitem", { name: "View full scope" }),
+    );
+    await user.click(
+      within(await screen.findByRole("dialog")).getByRole("button", {
+        name: "Allow this conversation",
+      }),
+    );
+    expect(mockSendToolApproval).toHaveBeenCalledWith({
+      approvalId: request.approvalId,
+      toolCallId: request.toolCallId,
+      decision: "approve",
+      grant: "target_prefix",
+      targetKind: "terminal_command",
+      targetPrefix: JSON.stringify(["agent-command-prefix-v2", argv]),
+    });
+  });
+
+  it("closes scope review when the pending scope changes", async () => {
+    const argv = ["printf", "x".repeat(500)];
+    const longRequest = {
+      ...request,
+      target: argv.join(" "),
+      prefixRule: argv,
+    };
+    const { rerender } = render(
+      <AgentApprovalPrompt request={longRequest} onStop={mockOnStop} />,
+    );
+    fireEvent.keyDown(
+      screen.getByRole("button", { name: "More approval options" }),
+      { key: "ArrowDown" },
+    );
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: "View full scope" }),
+    );
+    expect(await screen.findByRole("dialog")).toBeVisible();
+    rerender(
+      <AgentApprovalPrompt
+        request={{ ...longRequest, prefixRule: ["printf"] }}
+        onStop={mockOnStop}
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+    expect(mockSendToolApproval).not.toHaveBeenCalled();
+  });
+
+  it("does not offer conversation reuse for an unsafe command", () => {
+    render(
+      <AgentApprovalPrompt
+        request={{
+          ...request,
+          target: "npm test && npm publish",
+          prefixRule: ["npm", "test"],
+        }}
+        onRetryConnection={mockOnRetryConnection}
+        onStop={mockOnStop}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "More approval options" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers deletion reuse with the same explicit scope disclosure", async () => {
+    render(
+      <AgentApprovalPrompt
+        request={{ ...request, target: "rm scratch.txt", prefixRule: ["rm"] }}
+        onStop={mockOnStop}
+      />,
+    );
+    fireEvent.keyDown(
+      screen.getByRole("button", { name: "More approval options" }),
+      { key: "ArrowDown", code: "ArrowDown" },
+    );
+    expect(
+      await screen.findByText(
+        'Commands starting with [\u2068"rm"\u2069], with any following arguments',
+      ),
+    ).toBeVisible();
+    fireEvent.click(
+      await screen.findByRole("menuitem", {
+        name: 'Allow this conversation: Commands starting with [\u2068"rm"\u2069], with any following arguments',
+      }),
+    );
+    await waitFor(() =>
+      expect(mockSendToolApproval).toHaveBeenCalledWith({
+        approvalId: "approval-1",
+        toolCallId: "tool-1",
+        decision: "approve",
+        grant: "target_prefix",
+        targetKind: "terminal_command",
+        targetPrefix: '["agent-command-prefix-v2",["rm"]]',
+      }),
+    );
+  });
+
+  it("denies from the secondary action", async () => {
+    renderPrompt();
+
+    fireEvent.click(screen.getByRole("button", { name: "Deny" }));
+
+    await waitFor(() =>
+      expect(mockSendToolApproval).toHaveBeenCalledWith({
+        approvalId: "approval-1",
+        toolCallId: "tool-1",
+        decision: "deny",
+      }),
+    );
+  });
+
+  it("does not capture Enter from another editable field", () => {
+    render(
+      <>
+        <input aria-label="Outside input" />
+        <AgentApprovalPrompt
+          request={request}
+          onRetryConnection={mockOnRetryConnection}
+          onStop={mockOnStop}
+        />
+      </>,
+    );
+
+    fireEvent.keyDown(screen.getByLabelText("Outside input"), {
+      key: "Enter",
+      code: "Enter",
+    });
+
+    expect(mockSendToolApproval).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["button", <button key="button">Outside button</button>],
+    ["select", <select key="select" aria-label="Outside select" />],
+    ["summary", <summary key="summary">Outside summary</summary>],
+    [
+      "contenteditable",
+      <div key="contenteditable" contentEditable suppressContentEditableWarning>
+        Outside editor
+      </div>,
+    ],
+    [
+      "interactive ARIA role",
+      <div key="aria-button" role="button" tabIndex={0}>
+        Outside ARIA button
+      </div>,
+    ],
+  ])("does not capture Enter from an unrelated %s", (_name, element) => {
+    const { container } = render(
+      <>
+        {element}
+        <AgentApprovalPrompt
+          request={request}
+          onRetryConnection={mockOnRetryConnection}
+          onStop={mockOnStop}
+        />
+      </>,
+    );
+    const target = container.firstElementChild as HTMLElement;
+
+    fireEvent.keyDown(target, { key: "Enter", code: "Enter" });
+
+    expect(mockSendToolApproval).not.toHaveBeenCalled();
+  });
+
+  it("does not approve when an unrelated link is focused", () => {
+    render(
+      <>
+        <a href="/help">Approval help</a>
+        <AgentApprovalPrompt
+          request={request}
+          onRetryConnection={mockOnRetryConnection}
+          onStop={mockOnStop}
+        />
+      </>,
+    );
+    const link = screen.getByRole("link", { name: "Approval help" });
+    link.focus();
+
+    fireEvent.keyDown(document.body, { key: "Enter", code: "Enter" });
+
+    expect(link).toHaveFocus();
+    expect(mockSendToolApproval).not.toHaveBeenCalled();
+  });
+
+  it("does not approve from an unrelated noninteractive page target", () => {
+    render(
+      <>
+        <div data-testid="outside-copy">Outside copy</div>
+        <AgentApprovalPrompt
+          request={request}
+          onRetryConnection={mockOnRetryConnection}
+          onStop={mockOnStop}
+        />
+      </>,
+    );
+
+    fireEvent.keyDown(screen.getByTestId("outside-copy"), {
+      key: "Enter",
+      code: "Enter",
+    });
+
+    expect(mockSendToolApproval).not.toHaveBeenCalled();
+  });
+
+  it("requires one-time approval for file changes", async () => {
+    render(
+      <AgentApprovalPrompt
+        request={{
+          ...request,
+          kind: "file",
+          operation: "file_write",
+          target: "/workspace/report.txt",
+        }}
+        onRetryConnection={mockOnRetryConnection}
+        onStop={mockOnStop}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "More approval options" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
+
+    await waitFor(() =>
+      expect(mockSendToolApproval).toHaveBeenCalledWith({
+        approvalId: "approval-1",
+        toolCallId: "tool-1",
+        decision: "approve",
+      }),
+    );
+  });
+
+  it("shows reconnecting and stop controls without session credentials", () => {
+    mockSession = null;
+    renderPrompt();
+
+    expect(
+      screen.getByText("Reconnecting to the Agent approval session..."),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Allow once" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop agent" }));
+
+    expect(mockOnStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows retry and stop controls after reconnection fails", () => {
+    mockSession = null;
+    renderPrompt({ hasConnectionError: true });
+
+    expect(
+      screen.getByText("Could not reconnect to the Agent approval session."),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry connection" }));
+
+    expect(mockOnRetryConnection).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByRole("button", { name: "Stop agent" }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not submit modified Enter shortcuts", () => {
+    renderPrompt();
+
+    fireEvent.keyDown(document.body, {
+      key: "Enter",
+      code: "Enter",
+      shiftKey: true,
+    });
+
+    expect(mockSendToolApproval).not.toHaveBeenCalled();
+  });
+});

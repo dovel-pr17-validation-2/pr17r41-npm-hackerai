@@ -1,0 +1,78 @@
+// Keep last N messages unsummarized for context
+export const MESSAGES_TO_KEEP_UNSUMMARIZED = 0;
+
+// Reserve context headroom before compaction so the next request still has
+// enough room for tool schemas, provider formatting overhead, and output.
+export const SUMMARIZATION_RESERVED_MAX_TOKENS = 20_000;
+export const SUMMARIZATION_RESERVED_TOKEN_PERCENTAGE = 0.1;
+export const DEV_SUMMARIZATION_THRESHOLD_TOKENS_ENV =
+  "NEXT_PUBLIC_DEV_SUMMARIZATION_THRESHOLD_TOKENS";
+export const SUMMARY_PROMPT_VERSION = "2026-09-10.source-quotes-v6";
+
+const getDevSummarizationThresholdTokens = (
+  maxTokens: number,
+): number | null => {
+  if (process.env.NODE_ENV !== "development") return null;
+
+  const configuredTokens = Number.parseInt(
+    process.env.NEXT_PUBLIC_DEV_SUMMARIZATION_THRESHOLD_TOKENS ?? "",
+    10,
+  );
+
+  if (!Number.isFinite(configuredTokens) || configuredTokens <= 0) {
+    return null;
+  }
+
+  return Math.min(maxTokens, Math.floor(configuredTokens));
+};
+
+export const getSummarizationThresholdTokens = (maxTokens: number): number => {
+  const usableMaxTokens = Math.max(0, maxTokens);
+  const devThresholdTokens =
+    getDevSummarizationThresholdTokens(usableMaxTokens);
+  if (devThresholdTokens !== null) return devThresholdTokens;
+
+  const reservedTokens = Math.min(
+    SUMMARIZATION_RESERVED_MAX_TOKENS,
+    Math.floor(usableMaxTokens * SUMMARIZATION_RESERVED_TOKEN_PERCENTAGE),
+  );
+  return Math.max(0, usableMaxTokens - reservedTokens);
+};
+
+// Keep persisted todos useful in the synthetic summary without letting stored
+// todo payloads bypass chat token budgeting.
+export const SUMMARY_TODO_MAX_ITEMS = 100;
+export const SUMMARY_TODO_CONTENT_MAX_TOKENS = 256;
+export const SUMMARY_TODO_BLOCK_MAX_TOKENS = 4096;
+
+// Bound individual tool results fed into the summarizer. Agent tool outputs can
+// be enormous, and summarization should see a preview rather than raw logs.
+export const SUMMARY_TOOL_OUTPUT_MAX_TOKENS = 2048;
+export const SUMMARY_RECENT_MODEL_TAIL_MAX_TOKENS = 8_000;
+
+// Bound the entire model-message projection sent to the summarizer. This is a
+// second safety net after per-tool/media compaction.
+export const SUMMARY_INPUT_MAX_TOKENS = 64_000;
+// Prior checkpoints already condense earlier work. Reserve up to a quarter of
+// the normal input budget instead of clipping them like a verbose new message.
+export const SUMMARY_PRIOR_CHECKPOINT_MAX_TOKENS = 16_000;
+export const SUMMARY_OVERFLOW_TEXT_PART_MAX_TOKENS = 1024;
+export const SUMMARY_OVERFLOW_TOOL_OUTPUT_MAX_TOKENS = 512;
+
+// Bound consecutive compactions whose next provider prompt remains over the
+// threshold. Fixed system/tool overhead can make message-only savings
+// misleading; productive compactions may recur throughout a long Agent run.
+export const MAX_UNPRODUCTIVE_CONTEXT_COMPACTIONS_PER_STREAM = 2;
+
+// When a provider omits input usage, require substantial estimated headroom
+// before treating a compaction as productive.
+export const COMPACTION_ESTIMATE_RECOVERY_RATIO = 0.8;
+
+// A replacement checkpoint must remove at least 10% of serialized context.
+export const ROLLING_COMPACTION_MAX_SIZE_RATIO = 0.9;
+
+export const getSummaryInputMaxTokens = (maxTokens: number): number =>
+  Math.min(
+    SUMMARY_INPUT_MAX_TOKENS,
+    getSummarizationThresholdTokens(maxTokens),
+  );

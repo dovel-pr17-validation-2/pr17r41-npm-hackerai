@@ -1,0 +1,96 @@
+import type { NextConfig } from "next";
+
+const postHogSourceMapApiKey = process.env.POSTHOG_CLI_API_KEY?.trim();
+const postHogSourceMapProjectId = process.env.POSTHOG_CLI_PROJECT_ID?.trim();
+const hasPostHogSourceMapApiKey = Boolean(postHogSourceMapApiKey);
+const hasPostHogSourceMapProjectId = Boolean(postHogSourceMapProjectId);
+const hasPostHogSourceMapConfig =
+  hasPostHogSourceMapApiKey && hasPostHogSourceMapProjectId;
+const isVercelPreview = process.env.VERCEL_ENV === "preview";
+const isVercelProduction = process.env.VERCEL_ENV === "production";
+const posthogSourceMapsEnabled =
+  isVercelProduction && hasPostHogSourceMapConfig;
+
+// Freeze a public commit into the client bundle so SDK-only error stacks can
+// identify their own build even after a newer deployment becomes current.
+const buildCommit = (
+  process.env.VERCEL_GIT_COMMIT_SHA ?? process.env.GITHUB_SHA
+)?.trim();
+const publicBuildCommit =
+  buildCommit && /^[a-f0-9]{40}$/i.test(buildCommit)
+    ? buildCommit.toLowerCase()
+    : "";
+
+if (
+  (hasPostHogSourceMapApiKey || hasPostHogSourceMapProjectId) &&
+  !hasPostHogSourceMapConfig
+) {
+  console.warn(
+    "[PostHog] Source maps are disabled. Set both POSTHOG_CLI_API_KEY and POSTHOG_CLI_PROJECT_ID to enable upload.",
+  );
+}
+
+const nextConfig: NextConfig = {
+  devIndicators: false,
+  env: {
+    NEXT_PUBLIC_HACKERAI_BUILD_COMMIT: publicBuildCommit,
+  },
+  productionBrowserSourceMaps: posthogSourceMapsEnabled,
+  typescript: {
+    // Pull request CI runs pnpm typecheck while the preview builds in parallel.
+    ignoreBuildErrors: isVercelPreview,
+  },
+  async headers() {
+    const iconCacheHeaders = [
+      {
+        key: "Cache-Control",
+        value: "public, max-age=86400, stale-while-revalidate=604800",
+      },
+    ];
+
+    return [
+      {
+        source: "/manifest.json",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=3600, stale-while-revalidate=86400",
+          },
+        ],
+      },
+      { source: "/favicon.ico", headers: iconCacheHeaders },
+      { source: "/apple-touch-icon.png", headers: iconCacheHeaders },
+      { source: "/icon-192x192.png", headers: iconCacheHeaders },
+      { source: "/icon-256x256.png", headers: iconCacheHeaders },
+      { source: "/icon-512x512.png", headers: iconCacheHeaders },
+    ];
+  },
+  experimental: {
+    optimizePackageImports: ["lucide-react", "date-fns"],
+  },
+  ...(process.env.NODE_ENV === "development" && {
+    logging: {
+      serverFunctions: false,
+    },
+  }),
+  images: {
+    unoptimized: true,
+    remotePatterns: [
+      {
+        protocol: "http",
+        hostname: "localhost",
+      },
+      {
+        protocol: "http",
+        hostname: "127.0.0.1",
+      },
+      // Fallback for other external images
+      {
+        protocol: "https",
+        hostname: "**",
+      },
+    ],
+  },
+};
+
+export default nextConfig;

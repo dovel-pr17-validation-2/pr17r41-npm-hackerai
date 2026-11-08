@@ -1,0 +1,2576 @@
+import {
+  registerDesktopCommand,
+  wasDesktopRunStopped,
+} from "./desktop-command-cancellation";
+import { AcknowledgedCommandOutput } from "@/lib/centrifugo/acknowledged-command-output";
+import { OperationChannelRouter } from "@/packages/local/src/operation-channels";
+import { Centrifuge, errorCodes, type Subscription } from "centrifuge";
+import { captureAuthenticatedEvent } from "@/lib/analytics/client";
+import {
+  DesktopFileBridgeError,
+  getDesktopFileFailure,
+  type DesktopFileFailure,
+} from "@/lib/centrifugo/desktop-file-errors";
+import { DesktopAckTelemetry } from "@/lib/analytics/desktop-ack";
+import {
+  isDesktopAckStopSource,
+  type DesktopAckStopSource,
+} from "@/lib/analytics/desktop-ack-privacy";
+import { DesktopRelayTelemetry } from "@/lib/analytics/desktop-relay";
+import { isUnauthenticatedConvexError } from "@/lib/auth/expected-auth-errors";
+import {
+  sandboxConnectionChannel,
+  DESKTOP_COMMAND_DELIVERY_GRACE_MS,
+  type SandboxMessage,
+  type CommandCancelMessage,
+  type CommandMessage,
+  type PtyCreateMessage,
+  type PtyInputMessage,
+  type PtyResizeMessage,
+  type PtyKillMessage,
+  type FileRequestMessage,
+  type FileStatMessage,
+  type FileReadMessage,
+  type FileWriteMessage,
+  type FileAppendMessage,
+  type FileRemoveMessage,
+  type FileListMessage,
+} from "@/lib/centrifugo/types";
+import {
+  DEFAULT_PTY_COLS,
+  DEFAULT_PTY_ROWS,
+} from "@/lib/ai/tools/utils/pty-session-manager";
+import {
+  CentrifugoMessageReassembler,
+  CentrifugoPublishQueue,
+  RELAY_QUEUE_MAX_BYTES,
+  RELAY_QUEUE_MAX_MESSAGES,
+  RelayOutputOverflowError,
+} from "@/packages/local/src/centrifugo-transport";
+import { buildCentrifugoTransportConfig } from "@/packages/local/src/centrifugo-endpoints";
+import { LOCAL_SANDBOX_HEARTBEAT_INTERVAL_MS } from "@/lib/centrifugo/presence";
+
+type RefreshTokenResult =
+  | { ok: true; centrifugoToken: string }
+  | {
+      ok: false;
+      terminated: true;
+      reason:
+        "connection_not_found" | "ownership_mismatch" | "connection_inactive";
+      connectionId: string;
+      clientVersion: string | null;
+      status: string | null;
+      disconnectReason:
+        | "client_disconnect"
+        | "desktop_disconnect"
+        | "desktop_kicked_by_new_session"
+        | "token_regenerated"
+        | "presence_sweep"
+        | "command_unresponsive"
+        | null;
+      msSinceDisconnected: number | null;
+      msSinceLastHeartbeat: number | null;
+      msSinceCreated: number | null;
+    };
+
+type DesktopBridgeTerminationReason =
+  | "unauthenticated"
+  | "connection_not_found"
+  | "ownership_mismatch"
+  | "session_replaced"
+  | "connection_inactive"
+  | "transport_disconnected";
+
+type DesktopBridgeConnectionState = "connecting" | "connected";
+
+function terminationReason(
+  result: Extract<RefreshTokenResult, { ok: false }>,
+): DesktopBridgeTerminationReason {
+  return result.reason === "connection_inactive" &&
+    result.disconnectReason === "desktop_kicked_by_new_session"
+    ? "session_replaced"
+    : result.reason;
+}
+
+type DesktopStreamPublishFailureReason = "connection_closed" | "timeout";
+
+const DESKTOP_STREAM_PUBLISH_MAX_ATTEMPTS = 3;
+const DESKTOP_STREAM_PUBLISH_RETRY_BASE_DELAY_MS = 250;
+const DESKTOP_STREAM_RECONNECT_WAIT_MS = 5_000;
+const DESKTOP_STREAM_PENDING_MAX_BYTES = 256 * 1024;
+const DESKTOP_STREAM_PENDING_MAX_CHUNKS = 256;
+const DESKTOP_BRIDGE_READY_TIMEOUT_MS = 15_000;
+const DESKTOP_BRIDGE_RECONNECT_TIMEOUT_MS = 30_000;
+const DESKTOP_FILE_PROBE_TIMEOUT_MS = 3_000;
+
+/** Recognize browser transport failures without swallowing native filesystem errors. */
+function isFileTransportError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /^(load failed|failed to fetch|fetch failed|networkerror.*|network request failed)$/i.test(
+    message,
+  );
+}
+
+interface StreamChunk {
+  type: "stdout" | "stderr" | "exit" | "error";
+  data?: string;
+  exitCode?: number;
+  message?: string;
+}
+
+interface DesktopStreamPublishRecoveryState {
+  initialRelayGeneration: number;
+  failureReported: boolean;
+  recoveryReported: boolean;
+  exhaustionReported: boolean;
+  observedChunks: number;
+  publishedChunks: number;
+  exhaustedChunks: number;
+  terminalChunkObserved: "exit" | "error" | null;
+  terminalChunkPublished: boolean;
+}
+
+type DesktopStreamTelemetryContext = Pick<
+  CommandMessage,
+  "chatId" | "triggerRunId"
+>;
+
+function shouldForwardStreamChunk(chunk: StreamChunk): boolean {
+  if (chunk.type === "stdout" || chunk.type === "stderr") {
+    return Boolean(chunk.data);
+  }
+  return true;
+}
+
+function classifyDesktopStreamPublishFailure(
+  error: unknown,
+): DesktopStreamPublishFailureReason | null {
+  let code: unknown;
+  let message: unknown;
+
+  if (error instanceof Error) {
+    message = error.message;
+    try {
+      const parsed = JSON.parse(error.message) as unknown;
+      if (typeof parsed === "object" && parsed !== null) {
+        code = (parsed as { code?: unknown }).code;
+        message = (parsed as { message?: unknown }).message;
+      }
+    } catch {
+      // Centrifuge can also reject with a normal Error message.
+    }
+  } else if (typeof error === "object" && error !== null) {
+    code = (error as { code?: unknown }).code;
+    message = (error as { message?: unknown }).message;
+  } else {
+    message = error;
+  }
+
+  if (code === errorCodes.connectionClosed || message === "connection closed") {
+    return "connection_closed";
+  }
+  if (code === errorCodes.timeout || message === "timeout") {
+    return "timeout";
+  }
+  return null;
+}
+
+type OutputControl = {
+  type: "command_output_ack" | "command_output_resume";
+  commandId: string;
+  targetConnectionId: string;
+  sequence: number;
+};
+
+type TargetedIncomingMessage =
+  | OutputControl
+  | CommandMessage
+  | CommandCancelMessage
+  | FileRequestMessage
+  | PtyCreateMessage
+  | PtyInputMessage
+  | PtyResizeMessage
+  | PtyKillMessage;
+
+function isTargetedIncomingMessage(
+  message: unknown,
+): message is TargetedIncomingMessage {
+  if (typeof message !== "object" || message === null) {
+    return false;
+  }
+  const { type, targetConnectionId } = message as {
+    type?: unknown;
+    targetConnectionId?: unknown;
+  };
+  return (
+    typeof targetConnectionId === "string" &&
+    (type === "command" ||
+      type === "command_cancel" ||
+      type === "command_output_ack" ||
+      type === "command_output_resume" ||
+      type === "file_stat" ||
+      type === "file_read" ||
+      type === "file_write" ||
+      type === "file_append" ||
+      type === "file_remove" ||
+      type === "file_list" ||
+      type === "pty_create" ||
+      type === "pty_input" ||
+      type === "pty_resize" ||
+      type === "pty_kill")
+  );
+}
+
+// Join an existing auth-stop event to its backend failure without copying error
+// text. SDK formats may change; missing/malformed markers simply omit the ID.
+function nativeAuthDiagnostics(
+  error: unknown,
+  convexFunction:
+    | "localSandbox:heartbeatDesktop"
+    | "localSandbox:refreshCentrifugoTokenDesktop",
+): Record<string, string | number> {
+  const diagnostics: Record<string, string | number> = {
+    native_auth_diagnostic_version: 1,
+    // Distinguish this pending-heartbeat guard from older loaded bridges.
+    // This identifies the heartbeat policy, not the native binary or build.
+    heartbeat_backpressure_version: 1,
+    convex_function: convexFunction,
+  };
+  try {
+    const message = error instanceof Error ? error.message : undefined;
+    const match =
+      typeof message === "string"
+        ? message
+            .slice(0, 512)
+            .match(
+              /^\[CONVEX M\((localSandbox:(?:heartbeatDesktop|refreshCentrifugoTokenDesktop))\)\] \[Request ID: ([a-f0-9]{16})\]/,
+            )
+        : null;
+    if (match?.[1] === convexFunction) diagnostics.convex_request_id = match[2];
+  } catch {
+    // Diagnostics must not interrupt the existing authentication stop path.
+  }
+  return diagnostics;
+}
+
+interface DesktopBridgeConfig {
+  // The recovery owner keeps one telemetry window across replacement bridges.
+  relayTelemetry?: DesktopRelayTelemetry;
+  connectDesktop: (args: {
+    environmentId?: string;
+    connectionName: string;
+    osInfo?: {
+      platform: string;
+      arch: string;
+      release: string;
+      hostname: string;
+    };
+    capabilities?: {
+      commands: boolean;
+      pty: boolean;
+      files?: boolean;
+      operationChannels?: boolean;
+    };
+  }) => Promise<{
+    connectionId: string;
+    centrifugoToken: string;
+    centrifugoWsUrl: string;
+  }>;
+  refreshCentrifugoTokenDesktop: (args: {
+    connectionId: string;
+  }) => Promise<RefreshTokenResult>;
+  disconnectDesktop: (args: {
+    connectionId: string;
+  }) => Promise<{ success: boolean }>;
+  heartbeatDesktop: (args: {
+    connectionId: string;
+  }) => Promise<{ success: boolean }>;
+  onConnectionState?: (
+    state: DesktopBridgeConnectionState,
+    environmentId?: string,
+  ) => void;
+  onTerminated?: (reason: DesktopBridgeTerminationReason) => void;
+}
+
+export class DesktopSandboxBridge {
+  private environmentId?: string;
+
+  getEnvironmentId(): string | undefined {
+    return this.environmentId;
+  }
+  private client: Centrifuge | null = null;
+  private subscription: Subscription | null = null;
+  private connectionId: string | null = null;
+  private activeCommands = new Set<string>();
+  private commandDeliveryDeadlines = new Map<string, number>();
+  private commandDeliveryCleanupTimers = new Set<
+    ReturnType<typeof setTimeout>
+  >();
+  private isStoppingOrStopped = true;
+  private commandOutputStopSource: DesktopAckStopSource = "command_cleanup";
+  private startupGeneration = 0;
+  private config: DesktopBridgeConfig;
+  private publishQueue: CentrifugoPublishQueue | null = null;
+  private operationRouter: OperationChannelRouter<Subscription> | null = null;
+  private nativeFileIpcAvailable: boolean | null = null;
+  private nativeFileIpcFailure: DesktopFileFailure | undefined;
+  private nativeAppVersion = "unknown";
+  private nativePlatform = "unknown";
+
+  private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+  private heartbeatInFlightGeneration: number | null = null;
+  private consecutiveHeartbeatFailures = 0;
+  private relayUnavailableAt: number | null = null;
+  private successfulRelayConnections = 0;
+  private relayStarted = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly relayTelemetry: DesktopRelayTelemetry;
+  private readonly ackTelemetry = new DesktopAckTelemetry();
+  constructor(config: DesktopBridgeConfig) {
+    this.config = config;
+    this.relayTelemetry =
+      config.relayTelemetry ??
+      new DesktopRelayTelemetry(captureAuthenticatedEvent);
+  }
+
+  getConnectionId(): string | null {
+    return this.connectionId;
+  }
+
+  private logRelayState(
+    state: "connecting" | "connected" | "disconnected" | "error",
+    details: Record<string, unknown> = {},
+  ): void {
+    const properties = {
+      connectionId: this.connectionId,
+      clientSurface: "desktop_bridge",
+      state,
+      reconnectAttempt: Math.max(0, this.successfulRelayConnections - 1),
+      ...details,
+    };
+    const message = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event: "desktop_bridge_relay_state_changed",
+      ...properties,
+    });
+    if (state === "connected") {
+      console.info("[desktop-bridge]", message);
+    } else {
+      console.warn("[desktop-bridge]", message);
+    }
+    this.relayTelemetry.record(
+      state === "error"
+        ? "desktop_bridge_relay_error"
+        : "desktop_bridge_relay_state_changed",
+      properties,
+    );
+  }
+
+  private async sendHeartbeat(): Promise<void> {
+    const connectionId = this.connectionId;
+    const generation = this.startupGeneration;
+    if (
+      this.isStoppingOrStopped ||
+      !connectionId ||
+      this.heartbeatInFlightGeneration === generation
+    )
+      return;
+
+    // Convex queues unresolved mutations across disconnects. Keep the timer from
+    // building a heartbeat backlog while the current request is still pending.
+    this.heartbeatInFlightGeneration = generation;
+    try {
+      const result = await this.config.heartbeatDesktop({ connectionId });
+      if (
+        this.isStoppingOrStopped ||
+        this.connectionId !== connectionId ||
+        this.startupGeneration !== generation
+      )
+        return;
+      if (!result.success) {
+        // The legacy heartbeat response has no reason. Resolve it through the
+        // existing token endpoint so a displaced session cannot kick its replacement.
+        const state = await this.config.refreshCentrifugoTokenDesktop({
+          connectionId,
+        });
+        if (
+          this.isStoppingOrStopped ||
+          this.connectionId !== connectionId ||
+          this.startupGeneration !== generation
+        )
+          return;
+        const reason = state.ok
+          ? "connection_inactive"
+          : terminationReason(state);
+        this.logRelayState("disconnected", {
+          reason: "heartbeat_connection_inactive",
+          ...(isDesktopAckStopSource(reason) && { terminationReason: reason }),
+        });
+        this.terminateClient(reason);
+        return;
+      }
+      if (this.consecutiveHeartbeatFailures > 0) {
+        this.logRelayState("connected", {
+          source: "heartbeat",
+          recoveredAfterFailures: this.consecutiveHeartbeatFailures,
+        });
+        this.consecutiveHeartbeatFailures = 0;
+      }
+    } catch (error) {
+      if (
+        this.isStoppingOrStopped ||
+        this.connectionId !== connectionId ||
+        this.startupGeneration !== generation
+      )
+        return;
+      if (isUnauthenticatedConvexError(error)) {
+        this.logRelayState("disconnected", {
+          reason: "heartbeat_unauthenticated",
+          ...nativeAuthDiagnostics(error, "localSandbox:heartbeatDesktop"),
+        });
+        this.terminateClient("unauthenticated");
+        return;
+      }
+      this.consecutiveHeartbeatFailures += 1;
+      if (
+        this.consecutiveHeartbeatFailures === 1 ||
+        this.consecutiveHeartbeatFailures % 4 === 0
+      ) {
+        this.logRelayState("error", {
+          errorType: "heartbeat",
+          consecutiveFailures: this.consecutiveHeartbeatFailures,
+          error:
+            error instanceof Error ? error.message : String(error ?? "unknown"),
+        });
+      }
+    } finally {
+      if (this.heartbeatInFlightGeneration === generation) {
+        this.heartbeatInFlightGeneration = null;
+      }
+    }
+  }
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    void this.sendHeartbeat();
+    this.heartbeatInterval = setInterval(() => {
+      void this.sendHeartbeat();
+    }, LOCAL_SANDBOX_HEARTBEAT_INTERVAL_MS);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
+  private watchRelayReconnect(): void {
+    if (!this.relayStarted || this.reconnectTimer || this.isStoppingOrStopped)
+      return;
+    // Centrifuge pins its first working transport. A fresh bridge lets its
+    // WebSocket/HTTP fallback negotiation run again after a persistent outage.
+    // Only a ready subscription clears this deadline, not a socket handshake.
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.isStoppingOrStopped) return;
+      // An executing command and its retained output belong to this connection.
+      // Re-registering while the worker still awaits it abandons that output.
+      // Keep the SDK reconnecting until the bounded command delivery window ends.
+      if (
+        [...this.commandDeliveryDeadlines.values()].some(
+          (deadline) => deadline > Date.now(),
+        )
+      ) {
+        this.watchRelayReconnect();
+        return;
+      }
+      this.logRelayState("error", { errorType: "reconnect_readiness" });
+      this.terminateClient("transport_disconnected");
+    }, DESKTOP_BRIDGE_RECONNECT_TIMEOUT_MS);
+  }
+
+  private terminateClient(reason: DesktopBridgeTerminationReason): void {
+    if (this.isStoppingOrStopped) return;
+    this.commandOutputStopSource = reason;
+    this.isStoppingOrStopped = true;
+    for (const stream of this.acknowledgedOutputs.values()) stream.stop();
+    this.ackTelemetry.dispose();
+    this.acknowledgedOutputs.clear();
+    this.commandDeliveryDeadlines.clear();
+    for (const timer of this.commandDeliveryCleanupTimers) clearTimeout(timer);
+    this.commandDeliveryCleanupTimers.clear();
+    this.stopHeartbeat();
+    this.relayStarted = false;
+    this.clearReconnectTimer();
+    if (!this.config.relayTelemetry) {
+      this.relayTelemetry.flush();
+      this.relayTelemetry.reset();
+    }
+    const client = this.client;
+    const subscription = this.subscription;
+    this.client = null;
+    this.subscription = null;
+    this.publishQueue?.close();
+    this.publishQueue = null;
+    this.operationRouter?.stop();
+    this.operationRouter = null;
+    this.connectionId = null;
+    try {
+      subscription?.unsubscribe();
+    } catch {
+      // already in a terminal state
+    }
+    try {
+      subscription?.removeAllListeners();
+    } catch {
+      // already in a terminal state
+    }
+    try {
+      client?.disconnect();
+    } catch {
+      // already in a terminal state
+    }
+    this.config.onTerminated?.(reason);
+  }
+
+  async start(): Promise<string> {
+    const generation = ++this.startupGeneration;
+    const wasStopped = () =>
+      this.isStoppingOrStopped || generation !== this.startupGeneration;
+    this.isStoppingOrStopped = false;
+    this.commandOutputStopSource = "command_cleanup";
+    this.nativeFileIpcAvailable = null;
+    this.nativeFileIpcFailure = undefined;
+    // Older desktop binaries do not expose identity yet. Keep their legacy
+    // registration path until the native update is installed.
+    const { invoke } = await import("@tauri-apps/api/core");
+    let environmentId: string | undefined;
+    try {
+      environmentId = await invoke<string>("get_environment_id");
+    } catch (error) {
+      if (
+        !String(error).includes("get_environment_id") ||
+        !/not found|unknown command|not registered|not allowed by acl/i.test(
+          String(error),
+        )
+      )
+        throw error;
+    }
+    if (wasStopped()) throw new Error("Desktop bridge stopped during startup");
+    this.environmentId = environmentId;
+    // Identity is local; saved tasks must recognize this computer even when
+    // backend registration or relay readiness fails during startup.
+    if (environmentId) {
+      this.config.onConnectionState?.("connecting", environmentId);
+    }
+    const [osInfo, nativeAppVersion] = await Promise.all([
+      this.getOsInfo(),
+      this.getNativeAppVersion(),
+    ]);
+    if (wasStopped()) throw new Error("Desktop bridge stopped during startup");
+    this.nativeAppVersion = nativeAppVersion;
+    const platform =
+      osInfo?.platform === "win32" ? "windows" : osInfo?.platform;
+    this.nativePlatform = ["darwin", "linux", "windows"].includes(
+      platform ?? "",
+    )
+      ? platform!
+      : "unknown";
+    const files = await this.probeFileBridge();
+    if (wasStopped()) throw new Error("Desktop bridge stopped during startup");
+
+    const { connectionId, centrifugoToken, centrifugoWsUrl } =
+      await this.config.connectDesktop({
+        ...(environmentId ? { environmentId } : {}),
+        connectionName: osInfo?.hostname || "Desktop",
+        osInfo,
+        capabilities: {
+          commands: true,
+          pty: true,
+          files,
+          operationChannels: true,
+        },
+      });
+
+    if (wasStopped()) {
+      // stop() could not see this connection while registration was pending.
+      // Clean up only this attempt, without touching a newer start's relay.
+      void this.config.disconnectDesktop({ connectionId }).catch(() => {
+        console.warn(
+          "[DesktopSandboxBridge] Failed to disconnect canceled startup",
+        );
+      });
+      throw new Error("Desktop bridge stopped during startup");
+    }
+
+    this.connectionId = connectionId;
+
+    const transportConfig = buildCentrifugoTransportConfig(centrifugoWsUrl);
+    this.client = new Centrifuge(transportConfig.endpoints, {
+      token: centrifugoToken,
+      emulationEndpoint: transportConfig.emulationEndpoint,
+      getToken: async () => {
+        if (!this.connectionId) {
+          throw new Error(
+            "[DesktopSandboxBridge] Cannot refresh token: connectionId is null",
+          );
+        }
+        let result: RefreshTokenResult;
+        try {
+          result = await this.config.refreshCentrifugoTokenDesktop({
+            connectionId: this.connectionId,
+          });
+        } catch (error) {
+          if (isUnauthenticatedConvexError(error)) {
+            const eventProps = {
+              connectionId: this.connectionId,
+              clientSurface: "desktop_bridge",
+              reason: "unauthenticated" as const,
+              ...nativeAuthDiagnostics(
+                error,
+                "localSandbox:refreshCentrifugoTokenDesktop",
+              ),
+            };
+            console.warn(
+              "[DesktopSandboxBridge] Centrifugo refresh aborted — user not authenticated; stopping client to break retry loop",
+              eventProps,
+            );
+            captureAuthenticatedEvent(
+              "sandbox_connection_terminated",
+              eventProps,
+            );
+            this.terminateClient("unauthenticated");
+          } else {
+            console.error(
+              "[DesktopSandboxBridge] Failed to refresh Centrifugo token:",
+              error,
+            );
+          }
+          throw error;
+        }
+        if (result.ok) return result.centrifugoToken;
+
+        const eventProps = {
+          connectionId: this.connectionId,
+          clientSurface: "desktop_bridge",
+          reason: result.reason,
+          serverConnectionId: result.connectionId,
+          serverClientVersion: result.clientVersion,
+          serverStatus: result.status,
+          disconnectReason: result.disconnectReason,
+          msSinceDisconnected: result.msSinceDisconnected,
+          msSinceLastHeartbeat: result.msSinceLastHeartbeat,
+          msSinceCreated: result.msSinceCreated,
+        };
+        console.warn(
+          "[DesktopSandboxBridge] Centrifugo refresh aborted — server reports connection terminated; stopping client to break retry loop",
+          eventProps,
+        );
+        captureAuthenticatedEvent("sandbox_connection_terminated", eventProps);
+        this.terminateClient(terminationReason(result));
+        throw new Error(`Centrifugo refresh aborted: ${result.reason}`);
+      },
+    });
+    const client = this.client;
+
+    const userId = this.extractUserIdFromToken(centrifugoToken);
+    const channel = sandboxConnectionChannel(userId, connectionId);
+    const subscription = this.client.newSubscription(channel);
+    this.subscription = subscription;
+    this.publishQueue = new CentrifugoPublishQueue(async (message) => {
+      // Queued work can outlive stop() or a reconnect; never publish it on a
+      // replacement subscription.
+      if (this.isStoppingOrStopped || this.subscription !== subscription)
+        return;
+      await subscription.publish(message);
+    });
+
+    client.on("connecting", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      if (this.relayUnavailableAt === null) {
+        this.relayUnavailableAt = Date.now();
+      }
+      this.watchRelayReconnect();
+      this.config.onConnectionState?.("connecting");
+      this.logRelayState("connecting", {
+        code: ctx.code,
+        reason: ctx.reason,
+      });
+    });
+    client.on("connected", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      this.successfulRelayConnections += 1;
+      this.logRelayState("connected", {
+        transport: ctx.transport,
+        outageDurationMs:
+          this.relayUnavailableAt === null
+            ? 0
+            : Date.now() - this.relayUnavailableAt,
+      });
+      this.relayUnavailableAt = null;
+    });
+    client.on("disconnected", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      this.logRelayState("disconnected", {
+        code: ctx.code,
+        reason: ctx.reason,
+      });
+      this.terminateClient("transport_disconnected");
+    });
+    client.on("error", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      this.logRelayState("error", {
+        errorType: ctx.type,
+        code: ctx.error.code,
+        reason: ctx.error.message,
+        transport: ctx.transport,
+      });
+    });
+
+    subscription.on("subscribing", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      if (this.relayUnavailableAt === null) {
+        this.relayUnavailableAt = Date.now();
+      }
+      this.watchRelayReconnect();
+      this.config.onConnectionState?.("connecting");
+      this.logRelayState("connecting", {
+        source: "subscription",
+        code: ctx.code,
+        reason: ctx.reason,
+      });
+    });
+    subscription.on("subscribed", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      this.clearReconnectTimer();
+      this.config.onConnectionState?.("connected");
+      this.logRelayState("connected", {
+        source: "subscription",
+        recovered: ctx.recovered,
+        wasRecovering: ctx.wasRecovering,
+      });
+    });
+    subscription.on("unsubscribed", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      this.logRelayState("disconnected", {
+        source: "subscription",
+        code: ctx.code,
+        reason: ctx.reason,
+      });
+      this.terminateClient("transport_disconnected");
+    });
+    subscription.on("error", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      this.logRelayState("error", {
+        source: "subscription",
+        errorType: ctx.type,
+        code: ctx.error.code,
+        reason: ctx.error.message,
+      });
+    });
+
+    const handleIncoming = (message: unknown) => {
+      if (!isTargetedIncomingMessage(message)) {
+        return;
+      }
+
+      if (message.targetConnectionId !== this.connectionId) {
+        return;
+      }
+
+      switch (message.type) {
+        case "command":
+          this.handleCommand(message as CommandMessage).catch((err) => {
+            console.error(
+              "[DesktopSandboxBridge] Command handling failed:",
+              err,
+            );
+          });
+          break;
+
+        case "command_output_ack":
+        case "command_output_resume": {
+          const stream = this.acknowledgedOutputs.get(message.commandId);
+          if (message.type === "command_output_ack")
+            stream?.acknowledge(message.sequence);
+          else stream?.resume(message.sequence);
+          break;
+        }
+
+        case "command_cancel":
+          this.handleCommandCancel(message as CommandCancelMessage).catch(
+            (err) => {
+              console.error(
+                "[DesktopSandboxBridge] Command cancel failed:",
+                err,
+              );
+            },
+          );
+          break;
+
+        case "file_stat":
+          this.handleFileStat(message as FileStatMessage).catch((err) => {
+            console.error("[DesktopSandboxBridge] File stat failed:", err);
+          });
+          break;
+
+        case "file_read":
+          this.handleFileRead(message as FileReadMessage).catch((err) => {
+            console.error("[DesktopSandboxBridge] File read failed:", err);
+          });
+          break;
+
+        case "file_write":
+          this.handleFileWrite(message as FileWriteMessage).catch((err) => {
+            console.error("[DesktopSandboxBridge] File write failed:", err);
+          });
+          break;
+
+        case "file_append":
+          this.handleFileAppend(message as FileAppendMessage).catch((err) => {
+            console.error("[DesktopSandboxBridge] File append failed:", err);
+          });
+          break;
+
+        case "file_remove":
+          this.handleFileRemove(message as FileRemoveMessage).catch((err) => {
+            console.error("[DesktopSandboxBridge] File remove failed:", err);
+          });
+          break;
+
+        case "file_list":
+          this.handleFileList(message as FileListMessage).catch((err) => {
+            console.error("[DesktopSandboxBridge] File list failed:", err);
+          });
+          break;
+
+        case "pty_create":
+          this.handlePtyCreate(message as PtyCreateMessage).catch((err) => {
+            console.error("[DesktopSandboxBridge] PTY create failed:", err);
+          });
+          break;
+
+        case "pty_input":
+          this.handlePtyInput(message as PtyInputMessage).catch((err) => {
+            console.error("[DesktopSandboxBridge] PTY input failed:", err);
+          });
+          break;
+
+        case "pty_resize":
+          this.handlePtyResize(message as PtyResizeMessage).catch(() => {});
+          break;
+
+        case "pty_kill":
+          this.handlePtyKill(message as PtyKillMessage).catch(() => {});
+          break;
+
+        default:
+          break;
+      }
+    };
+    const operationRouter = new OperationChannelRouter<Subscription>(
+      client,
+      userId,
+      connectionId,
+      (operation) => {
+        void import("@tauri-apps/api/core")
+          .then(({ invoke }) => {
+            if (operation.kind === "pty")
+              return invoke("execute_pty_kill", { sessionId: operation.id });
+            if (operation.kind === "command")
+              return invoke("cancel_stream_command", {
+                commandId: operation.id,
+              });
+          })
+          .catch(() => {
+            console.error(
+              "[DesktopSandboxBridge] Output overflow cleanup failed",
+            );
+          });
+      },
+    );
+    this.operationRouter = operationRouter;
+    const reassembler = new CentrifugoMessageReassembler();
+    this.subscription.on("publication", (ctx) => {
+      const message = reassembler.accept(ctx.data);
+      if (
+        !message ||
+        this.isStoppingOrStopped ||
+        this.operationRouter !== operationRouter
+      )
+        return;
+      void operationRouter.dispatch(message, handleIncoming).catch((error) => {
+        console.error(
+          "[DesktopSandboxBridge] Operation subscription failed:",
+          error,
+        );
+      });
+    });
+
+    this.subscription.subscribe();
+    client.connect();
+
+    try {
+      await Promise.all([
+        client.ready(DESKTOP_BRIDGE_READY_TIMEOUT_MS),
+        subscription.ready(DESKTOP_BRIDGE_READY_TIMEOUT_MS),
+      ]);
+    } catch (error) {
+      this.logRelayState("error", {
+        errorType: "startup_readiness",
+        error:
+          error instanceof Error ? error.message : String(error ?? "unknown"),
+      });
+      throw error;
+    }
+    if (wasStopped() || this.connectionId !== connectionId) {
+      throw new Error("Desktop bridge stopped before relay became ready");
+    }
+    this.relayStarted = true;
+    this.config.onConnectionState?.("connected");
+    this.startHeartbeat();
+
+    return connectionId;
+  }
+
+  private extractUserIdFromToken(token: string): string {
+    const parts = token.split(".");
+    if (parts.length !== 3) throw new Error("Invalid JWT");
+    let b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4) b64 += "=";
+    const payload = JSON.parse(atob(b64));
+    if (!payload.sub || typeof payload.sub !== "string") {
+      throw new Error("JWT missing 'sub' claim");
+    }
+    return payload.sub;
+  }
+
+  private async getNativeAppVersion(): Promise<string> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const version = await Promise.race([
+        invoke<unknown>("plugin:app|version"),
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), 500);
+        }),
+      ]);
+      // Only the native package version, never the fixed browser user agent or
+      // arbitrary error text. Diagnostics must not delay or prevent recovery.
+      return typeof version === "string" &&
+        /^\d{1,5}\.\d{1,5}\.\d{1,5}$/.test(version)
+        ? version
+        : "unknown";
+    } catch {
+      return "unknown";
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async getOsInfo(): Promise<
+    | { platform: string; arch: string; release: string; hostname: string }
+    | undefined
+  > {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const result = await invoke<{
+        stdout: string;
+        stderr: string;
+        exit_code: number;
+      }>("execute_command", {
+        command: "uname -srm && hostname",
+        timeoutMs: 5000,
+      });
+      if (result.exit_code === 0) {
+        const lines = result.stdout.trim().split("\n");
+        const [uname, hostname] = [lines[0] || "", lines[1] || "Desktop"];
+        const parts = uname.split(" ");
+        return {
+          platform:
+            parts[0]?.toLowerCase() === "darwin"
+              ? "darwin"
+              : parts[0]?.toLowerCase() || "unknown",
+          release: parts[1] || "unknown",
+          arch: parts[2] || "unknown",
+          hostname: hostname.trim(),
+        };
+      }
+
+      // uname failed — try Windows-specific detection
+      const winResult = await invoke<{
+        stdout: string;
+        stderr: string;
+        exit_code: number;
+      }>("execute_command", {
+        command: "ver && hostname",
+        timeoutMs: 5000,
+      });
+      if (winResult.exit_code === 0) {
+        const lines = winResult.stdout.trim().split("\n").filter(Boolean);
+        // `ver` outputs e.g. "Microsoft Windows [Version 10.0.22631.4890]"
+        const verLine = lines[0] || "";
+        const hostname = lines[1]?.trim() || "Desktop";
+        const versionMatch = verLine.match(/\[Version\s+([\d.]+)\]/i);
+        const archResult = await invoke<{
+          stdout: string;
+          stderr: string;
+          exit_code: number;
+        }>("execute_command", {
+          command: "echo %PROCESSOR_ARCHITECTURE%",
+          timeoutMs: 5000,
+        });
+        const arch =
+          archResult.exit_code === 0
+            ? archResult.stdout.trim().toLowerCase()
+            : "unknown";
+        return {
+          platform: "win32",
+          release: versionMatch?.[1] || "unknown",
+          arch: arch === "amd64" ? "x64" : arch,
+          hostname,
+        };
+      }
+    } catch (error) {
+      console.warn("[DesktopSandboxBridge] Failed to get OS info:", error);
+    }
+    return undefined;
+  }
+
+  private acknowledgedOutputs = new Map<string, AcknowledgedCommandOutput>();
+
+  private async handleAcknowledgedCommand(
+    command: CommandMessage,
+  ): Promise<void> {
+    const router = this.operationRouter!;
+    const connectionId = this.connectionId;
+    const deadline =
+      Date.now() +
+      (command.timeout ?? 30_000) +
+      DESKTOP_COMMAND_DELIVERY_GRACE_MS;
+    let terminalExitCode: number | null = null;
+    const onSettled = this.ackTelemetry.start({
+      connectionId,
+      commandId: command.commandId,
+      chatId: command.chatId,
+      triggerRunId: command.triggerRunId,
+    });
+    const stream = new AcknowledgedCommandOutput(
+      command.commandId,
+      deadline,
+      (frame) => router.publish(frame as unknown as Record<string, unknown>),
+      () =>
+        !this.isStoppingOrStopped &&
+        this.operationRouter === router &&
+        this.connectionId === connectionId,
+      (settlement) =>
+        onSettled(
+          { ...settlement, terminalExitCode },
+          this.commandOutputStopSource,
+        ),
+    );
+    this.acknowledgedOutputs.set(command.commandId, stream);
+    this.commandDeliveryDeadlines.set(command.commandId, deadline);
+    this.activeCommands.add(command.commandId);
+    try {
+      const { invoke, Channel } = await import("@tauri-apps/api/core");
+      const channel = new Channel<StreamChunk>();
+      channel.onmessage = (chunk) => {
+        if (chunk.type === "exit") terminalExitCode = chunk.exitCode ?? null;
+        if (shouldForwardStreamChunk(chunk)) stream.append(chunk);
+      };
+      try {
+        if (wasDesktopRunStopped(command.chatId, command.triggerRunId)) {
+          terminalExitCode = 130;
+          stream.append({ type: "exit", exitCode: 130 });
+        } else {
+          await invoke("execute_stream_command", {
+            commandId: command.commandId,
+            command: command.command,
+            cwd: command.cwd,
+            env: command.env,
+            timeoutMs: command.timeout ?? 30_000,
+            onEvent: channel,
+          });
+        }
+      } catch (error) {
+        stream.append({
+          type: "error",
+          message: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        this.activeCommands.delete(command.commandId);
+      }
+      // Native completion and result delivery have separate lifetimes.
+      await stream.delivered;
+    } catch (error) {
+      if (stream.canceled) return;
+      console.warn("[desktop-bridge] acknowledged output incomplete", {
+        commandId: command.commandId,
+      });
+      // Explicitly fail completeness, never synthesize successful exit or rerun.
+      if (this.operationRouter === router && !this.isStoppingOrStopped) {
+        await router
+          .publish({
+            type: "command_output_unavailable",
+            commandId: command.commandId,
+            message:
+              error instanceof Error
+                ? error.message
+                : "Command output recovery failed",
+          })
+          .catch(() => {});
+      }
+    } finally {
+      stream.stop();
+      this.acknowledgedOutputs.delete(command.commandId);
+      this.commandDeliveryDeadlines.delete(command.commandId);
+      this.activeCommands.delete(command.commandId);
+      // Retain only the lightweight route after cancellation: a lost cancel
+      // response must still be answerable on retry. Its existing TTL closes it.
+      if (!stream.canceled) router.closeCommand(command.commandId);
+    }
+  }
+
+  private async handleCommand(command: CommandMessage): Promise<void> {
+    const unregister = registerDesktopCommand(
+      command.commandId,
+      command.chatId,
+      command.triggerRunId,
+    );
+    try {
+      await this.executeCommand(command);
+    } finally {
+      unregister();
+    }
+  }
+
+  private async executeCommand(command: CommandMessage): Promise<void> {
+    if (
+      command.outputProtocol === "ack-v1" &&
+      this.operationRouter?.retainCommandOutput(command.commandId)
+    ) {
+      return this.handleAcknowledgedCommand(command);
+    }
+    const { commandId } = command;
+    const commandConnectionId = this.connectionId;
+    const commandRouter = this.operationRouter;
+    const canPublish = () =>
+      !this.isStoppingOrStopped &&
+      this.connectionId === commandConnectionId &&
+      this.operationRouter === commandRouter;
+    const telemetryContext: DesktopStreamTelemetryContext = {
+      chatId: command.chatId,
+      triggerRunId: command.triggerRunId,
+    };
+    this.activeCommands.add(commandId);
+    const commandStartedAt = Date.now();
+    const recoveryState: DesktopStreamPublishRecoveryState = {
+      initialRelayGeneration: this.successfulRelayConnections,
+      failureReported: false,
+      recoveryReported: false,
+      exhaustionReported: false,
+      observedChunks: 0,
+      publishedChunks: 0,
+      exhaustedChunks: 0,
+      terminalChunkObserved: null,
+      terminalChunkPublished: false,
+    };
+
+    let nativeInvocationSettled = false;
+    let terminalDeliverySettled = false;
+    let settlementReported = false;
+    const reportSettlement = (deadlineReached = false) => {
+      if (
+        !recoveryState.failureReported ||
+        settlementReported ||
+        (!terminalDeliverySettled && !deadlineReached)
+      )
+        return;
+      settlementReported = true;
+      recoveryState.exhaustedChunks =
+        recoveryState.observedChunks - recoveryState.publishedChunks;
+      this.reportDesktopStreamCommandSettlement(
+        commandId,
+        recoveryState,
+        Date.now() - commandStartedAt,
+        telemetryContext,
+      );
+    };
+
+    try {
+      const { invoke, Channel } = await import("@tauri-apps/api/core");
+
+      const channel = new Channel<StreamChunk>();
+      const recoveryDeadlineAt =
+        Date.now() +
+        (command.timeout ?? 30_000) +
+        DESKTOP_COMMAND_DELIVERY_GRACE_MS;
+      this.commandDeliveryDeadlines.set(commandId, recoveryDeadlineAt);
+      let nextSequence = 0;
+      let streamPublishTail: Promise<void> = Promise.resolve();
+      const pendingChunks = new Map<
+        number,
+        { chunk: StreamChunk; bytes: number }
+      >();
+      let pendingBytes = 0;
+      let deliveryBlocked = false;
+      let bufferLimitExceeded = false;
+      const retainChunk = (sequence: number, chunk: StreamChunk) => {
+        if (bufferLimitExceeded) return;
+        const bytes = new TextEncoder().encode(
+          chunk.data ?? chunk.message ?? "",
+        ).byteLength;
+        if (
+          pendingChunks.size >= DESKTOP_STREAM_PENDING_MAX_CHUNKS ||
+          pendingBytes + bytes > DESKTOP_STREAM_PENDING_MAX_BYTES
+        ) {
+          bufferLimitExceeded = true;
+          return;
+        }
+        pendingChunks.set(sequence, { chunk, bytes });
+        pendingBytes += bytes;
+      };
+      const acknowledgeChunk = (sequence: number) => {
+        const pending = pendingChunks.get(sequence);
+        if (pending) pendingBytes -= pending.bytes;
+        pendingChunks.delete(sequence);
+      };
+
+      const flushPending = async () => {
+        if (bufferLimitExceeded) return;
+        for (const [sequence, { chunk }] of pendingChunks) {
+          if (!canPublish() || Date.now() >= recoveryDeadlineAt) return;
+          try {
+            await this.forwardChunkWithRetry(
+              commandId,
+              chunk,
+              sequence,
+              recoveryState,
+              recoveryDeadlineAt,
+              telemetryContext,
+              canPublish,
+            );
+            if (canPublish()) acknowledgeChunk(sequence);
+          } catch (error) {
+            if (!classifyDesktopStreamPublishFailure(error)) throw error;
+            return;
+          }
+        }
+        deliveryBlocked = pendingChunks.size > 0;
+      };
+      let recoveryTask: Promise<void> | undefined;
+      const startRecovery = () => {
+        if (recoveryTask) return;
+        // Native callbacks are not awaited by Tauri. Drain retained output even
+        // while the process is still running, and keep trying after it exits.
+        // Serialize retries with new output; preserve original sequence numbers
+        // so uncertain publish acknowledgments cannot duplicate tool output.
+        recoveryTask = (async () => {
+          while (
+            canPublish() &&
+            deliveryBlocked &&
+            !bufferLimitExceeded &&
+            Date.now() < recoveryDeadlineAt
+          ) {
+            await new Promise((resolve) =>
+              setTimeout(
+                resolve,
+                Math.min(1_000, recoveryDeadlineAt - Date.now()),
+              ),
+            );
+            const retry = streamPublishTail.then(flushPending);
+            streamPublishTail = retry.catch(() => undefined);
+            await retry;
+          }
+        })()
+          .catch(() => {
+            // forwardChunkWithRetry already reports non-transient failures.
+            // Do not produce an unhandled rejection from this background drain.
+          })
+          .finally(() => {
+            recoveryTask = undefined;
+            void streamPublishTail.then(() => {
+              if (
+                recoveryState.terminalChunkObserved !== null &&
+                !recoveryTask
+              ) {
+                terminalDeliverySettled = true;
+                if (nativeInvocationSettled) reportSettlement();
+              }
+            });
+          });
+      };
+
+      channel.onmessage = (chunk) => {
+        if (!shouldForwardStreamChunk(chunk)) return;
+
+        const sequence = nextSequence++;
+        recoveryState.observedChunks += 1;
+        if (chunk.type === "exit" || chunk.type === "error") {
+          recoveryState.terminalChunkObserved = chunk.type;
+        }
+        const operation = streamPublishTail.then(async () => {
+          if (!canPublish()) return;
+          if (deliveryBlocked) {
+            // Bound recovery history, without limiting healthy output streams.
+            // Never send a later sequence or exit after losing retained data.
+            retainChunk(sequence, chunk);
+            return;
+          }
+          try {
+            await this.forwardChunkWithRetry(
+              commandId,
+              chunk,
+              sequence,
+              recoveryState,
+              recoveryDeadlineAt,
+              telemetryContext,
+              canPublish,
+            );
+            if (canPublish()) acknowledgeChunk(sequence);
+          } catch (error) {
+            // Tauri does not await Channel callbacks. Exhausted known
+            // transients are already reported above, so keep them from
+            // becoming one unhandled rejection per subsequent stream chunk.
+            // Unknown failures are logged before reaching this catch and
+            // remain rejected for callers that directly await this operation.
+            if (!classifyDesktopStreamPublishFailure(error)) throw error;
+            deliveryBlocked = true;
+            retainChunk(sequence, chunk);
+            startRecovery();
+          }
+        });
+        streamPublishTail = operation.catch(() => undefined);
+        void streamPublishTail.then(() => {
+          if (
+            (chunk.type === "exit" || chunk.type === "error") &&
+            !recoveryTask
+          ) {
+            terminalDeliverySettled = true;
+            if (nativeInvocationSettled) reportSettlement();
+          }
+        });
+        return operation;
+      };
+
+      try {
+        if (wasDesktopRunStopped(command.chatId, command.triggerRunId)) {
+          channel.onmessage({ type: "exit", exitCode: 130 });
+        } else {
+          await invoke("execute_stream_command", {
+            commandId,
+            command: command.command,
+            cwd: command.cwd,
+            env: command.env,
+            timeoutMs: command.timeout ?? 30000,
+            onEvent: channel,
+          });
+        }
+      } finally {
+        // Delivery can outlive the process. A later Stop must still acknowledge
+        // that there is no native process left to cancel.
+        this.activeCommands.delete(commandId);
+        nativeInvocationSettled = true;
+      }
+      const settledDelivery = streamPublishTail.then(flushPending);
+      streamPublishTail = settledDelivery.catch(() => undefined);
+      await settledDelivery;
+      await recoveryTask;
+      if (recoveryState.exhaustionReported || bufferLimitExceeded) {
+        recoveryState.exhaustedChunks =
+          recoveryState.observedChunks - recoveryState.publishedChunks;
+      }
+      if (bufferLimitExceeded) {
+        captureAuthenticatedEvent("desktop_stream_buffer_limit_exceeded", {
+          connectionId: commandConnectionId,
+          commandId,
+          ...telemetryContext,
+          pendingChunks: pendingChunks.size,
+          pendingBytes,
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(
+        "[desktop-bridge]",
+        JSON.stringify({
+          event: "desktop_stream_command_failed",
+          service: "desktop_bridge",
+          command_id: commandId,
+          message,
+        }),
+      );
+      if (canPublish()) {
+        await this.publishResult({
+          type: "error",
+          commandId,
+          message,
+        });
+      }
+    } finally {
+      const deadline = this.commandDeliveryDeadlines.get(commandId);
+      if (!terminalDeliverySettled && deadline !== undefined) {
+        // IPC invocation completion does not wait for Channel delivery. Preserve
+        // ownership for callbacks still in transit, but never beyond the window.
+        const timer = setTimeout(
+          () => {
+            this.commandDeliveryCleanupTimers.delete(timer);
+            if (this.commandDeliveryDeadlines.get(commandId) === deadline) {
+              this.commandDeliveryDeadlines.delete(commandId);
+            }
+            reportSettlement(true);
+          },
+          Math.max(0, deadline - Date.now()),
+        );
+        this.commandDeliveryCleanupTimers.add(timer);
+      } else {
+        this.commandDeliveryDeadlines.delete(commandId);
+      }
+      reportSettlement(!canPublish());
+      this.activeCommands.delete(commandId);
+    }
+  }
+
+  private reportDesktopStreamCommandSettlement(
+    commandId: string,
+    recoveryState: DesktopStreamPublishRecoveryState,
+    durationMs: number,
+    telemetryContext: DesktopStreamTelemetryContext,
+  ): void {
+    if (!recoveryState.failureReported) return;
+
+    const outcome =
+      recoveryState.exhaustedChunks > 0
+        ? "incomplete"
+        : recoveryState.publishedChunks === recoveryState.observedChunks &&
+            recoveryState.terminalChunkPublished
+          ? "recovered"
+          : "interrupted";
+    const properties = {
+      connectionId: this.connectionId,
+      commandId,
+      ...(telemetryContext.chatId && { chatId: telemetryContext.chatId }),
+      ...(telemetryContext.triggerRunId && {
+        triggerRunId: telemetryContext.triggerRunId,
+      }),
+      outcome,
+      observedChunks: recoveryState.observedChunks,
+      publishedChunks: recoveryState.publishedChunks,
+      exhaustedChunks: recoveryState.exhaustedChunks,
+      terminalChunkObserved: recoveryState.terminalChunkObserved,
+      terminalChunkPublished: recoveryState.terminalChunkPublished,
+      sequenceComplete:
+        recoveryState.observedChunks === recoveryState.publishedChunks,
+      durationMs,
+    };
+    const log = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level: outcome === "recovered" ? "info" : "error",
+      event: "desktop_stream_command_settled",
+      service: "desktop_bridge",
+      environment: process.env.NODE_ENV ?? "unknown",
+      request_id: commandId,
+      connection_id: this.connectionId,
+      command_id: commandId,
+      chat_id: telemetryContext.chatId,
+      trigger_run_id: telemetryContext.triggerRunId,
+      outcome,
+      observed_chunks: recoveryState.observedChunks,
+      published_chunks: recoveryState.publishedChunks,
+      exhausted_chunks: recoveryState.exhaustedChunks,
+      terminal_chunk_observed: recoveryState.terminalChunkObserved,
+      terminal_chunk_published: recoveryState.terminalChunkPublished,
+      sequence_complete:
+        recoveryState.observedChunks === recoveryState.publishedChunks,
+      duration_ms: durationMs,
+    });
+
+    if (outcome === "recovered") {
+      console.info(log);
+    } else {
+      console.error(log);
+    }
+    captureAuthenticatedEvent("desktop_stream_command_settled", properties);
+  }
+
+  private getErrorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  private fileReplyPublisher(): (message: SandboxMessage) => Promise<void> {
+    const router = this.operationRouter;
+    const subscription = this.subscription;
+    return (message) => {
+      // Native I/O may finish after stop/re-registration. Never send an old
+      // operation's result on the replacement connection.
+      if (this.operationRouter !== router || this.subscription !== subscription)
+        return Promise.resolve();
+      return this.publishResult(message);
+    };
+  }
+
+  private async publishFileError(
+    requestId: string,
+    error: unknown,
+    reply: (message: SandboxMessage) => Promise<void>,
+  ): Promise<void> {
+    const fileFailure = getDesktopFileFailure(error);
+    await reply({
+      type: "file_error",
+      requestId,
+      message: this.getErrorMessage(error),
+      ...(fileFailure !== "unknown" ? { fileFailure } : {}),
+    });
+  }
+
+  private unavailableNativeFileCommand(
+    error: unknown,
+  ): DesktopFileFailure | undefined {
+    const message = this.getErrorMessage(error);
+    if (
+      /^(?:command )?desktop_file_request not allowed(?: by acl)?\b/i.test(
+        message,
+      )
+    )
+      return "native_ipc_denied";
+    if (
+      /^(?:command )?desktop_file_request (?:not found|not registered)$/i.test(
+        message,
+      ) ||
+      /^unknown command:? ['"]?desktop_file_request['"]?$/i.test(message)
+    )
+      return "native_ipc_unavailable";
+    return undefined;
+  }
+
+  private async callLegacyLocalFileServer<T>(
+    route: string,
+    body: Record<string, unknown>,
+  ): Promise<T> {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const info = await invoke<{ port: number; token: string }>(
+      "get_cmd_server_info",
+    );
+    if (!info.port || !info.token) {
+      throw new DesktopFileBridgeError(
+        "legacy_http_rejected",
+        "Desktop file server is not ready. Fully reopen HackerAI Desktop and reconnect.",
+      );
+    }
+
+    const response = await fetch(`http://127.0.0.1:${info.port}${route}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${info.token}`,
+      },
+      body: JSON.stringify(body),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new DesktopFileBridgeError(
+        "legacy_http_rejected",
+        typeof payload?.error === "string"
+          ? payload.error
+          : `Desktop file server request failed: ${response.status}`,
+      );
+    }
+    return payload as T;
+  }
+
+  /** Check file transport availability without creating files or hanging terminal startup. */
+  private async probeFileBridge(): Promise<boolean> {
+    // A startup transport hiccup must not pin this connection to files=false.
+    // Retry only this read-only probe, within the original total startup budget.
+    const deadline = Date.now() + DESKTOP_FILE_PROBE_TIMEOUT_MS;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const remainingMs = deadline - Date.now();
+      if (this.isStoppingOrStopped || remainingMs <= 0) return false;
+      if (await this.probeFileBridgeOnce(remainingMs)) return true;
+    }
+    return false;
+  }
+
+  private async probeFileBridgeOnce(timeoutMs: number): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // A read-only directory stat checks the transport without creating files
+      // or depending on a particular home directory or shell.
+      const payload = await Promise.race([
+        this.callDesktopFileBridge<{ kind: string; path: string }>(
+          "file_stat",
+          "/files/stat",
+          { path: "." },
+        ),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("Desktop file probe timed out")),
+            timeoutMs,
+          );
+        }),
+      ]);
+      if (
+        !payload ||
+        payload.kind !== "not_file" ||
+        typeof payload.path !== "string"
+      ) {
+        throw new DesktopFileBridgeError(
+          "invalid_response",
+          "Invalid desktop file probe response",
+        );
+      }
+      return true;
+    } catch (error) {
+      // A filesystem permission error proves the handler responded. Keep native
+      // handling so an access denial cannot silently select a different adapter.
+      const message = this.getErrorMessage(error);
+      const permissionDenied =
+        /permission denied|access denied|operation not permitted|forbidden/i.test(
+          message,
+        );
+      captureAuthenticatedEvent("desktop_file_bridge_probe_failed", {
+        transport:
+          this.nativeFileIpcAvailable === false ? "legacy_http" : "native_ipc",
+        reason: permissionDenied ? "permission_denied" : "unavailable",
+        native_failure: this.nativeFileIpcFailure,
+        file_failure: getDesktopFileFailure(error),
+        native_app_version: this.nativeAppVersion,
+        native_platform: this.nativePlatform,
+      });
+      // A native ACL rejection cannot recover through relay retries. Do not
+      // register a connected computer that every subsequent Agent will reject,
+      // or bypass the denial through the HTTP/command adapters.
+      if (getDesktopFileFailure(error) === "native_ipc_denied") throw error;
+      return permissionDenied;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async callDesktopFileBridge<T>(
+    requestType:
+      | "file_stat"
+      | "file_read"
+      | "file_write"
+      | "file_append"
+      | "file_remove"
+      | "file_list",
+    legacyRoute: string,
+    body: Record<string, unknown>,
+  ): Promise<T> {
+    if (this.nativeFileIpcAvailable !== false) {
+      const { invoke } = await import("@tauri-apps/api/core");
+      try {
+        const payload = await invoke<T>("desktop_file_request", {
+          request: { ...body, type: requestType },
+        });
+        this.nativeFileIpcAvailable = true;
+        this.nativeFileIpcFailure = undefined;
+        return payload;
+      } catch (error) {
+        const unavailable = this.unavailableNativeFileCommand(error);
+        if (!unavailable) {
+          if (isFileTransportError(error)) {
+            throw this.fileTransportFailure(requestType, "native_ipc");
+          }
+          throw error;
+        }
+        this.nativeFileIpcFailure = unavailable;
+        if (unavailable === "native_ipc_denied") {
+          throw new DesktopFileBridgeError(
+            unavailable,
+            "Desktop native file access is denied by the app permissions. Update and fully reopen HackerAI Desktop, then reconnect.",
+          );
+        }
+        this.nativeFileIpcAvailable = false;
+        console.warn(
+          "[desktop-bridge] Native file IPC is unavailable; using the legacy loopback bridge",
+        );
+      }
+    }
+
+    // Binaries predating IPC may silently ignore allowed_root. Never send a
+    // scoped mutation to a handler whose containment support is unverified.
+    if (
+      (requestType === "file_write" || requestType === "file_append") &&
+      typeof body.allowed_root === "string" &&
+      body.allowed_root.trim()
+    ) {
+      throw new DesktopFileBridgeError(
+        "scoped_write_requires_native",
+        "Project-folder writes require the native file API. Update HackerAI Desktop, fully reopen it and reconnect before retrying. No file write was sent.",
+      );
+    }
+    try {
+      return await this.callLegacyLocalFileServer<T>(legacyRoute, body);
+    } catch (error) {
+      if (isFileTransportError(error)) {
+        throw this.fileTransportFailure(requestType, "legacy_http");
+      }
+      throw error;
+    }
+  }
+
+  /** Report the failing adapter without logging paths, content, credentials, or raw errors. */
+  private fileTransportFailure(
+    operation: string,
+    transport: "native_ipc" | "legacy_http",
+  ): Error {
+    captureAuthenticatedEvent("desktop_file_bridge_transport_failed", {
+      connectionId: this.connectionId,
+      operation,
+      transport,
+      native_failure: this.nativeFileIpcFailure,
+    });
+    return new DesktopFileBridgeError(
+      transport === "legacy_http"
+        ? "legacy_http_transport"
+        : "native_ipc_transport",
+      `Desktop file bridge transport failed (${transport}, ${operation}). ${transport === "legacy_http" ? "Update and fully reopen HackerAI Desktop, then reconnect." : "Reconnect the Desktop app and retry after it is ready."}${["file_write", "file_append", "file_remove"].includes(operation) ? " A file change may have completed; verify the file before retrying a mutation." : ""} This is not a file-permission diagnosis.`,
+    );
+  }
+
+  private countLines(content: string): number {
+    if (content.length === 0) return 0;
+    return content.endsWith("\n")
+      ? content.split("\n").length - 1
+      : content.split("\n").length;
+  }
+
+  private normalizeReadPayload(
+    path: string,
+    payload: unknown,
+    range?: [number, number],
+  ): {
+    path: string;
+    sizeBytes: number;
+    totalLines: number;
+    content?: string;
+    startLine?: number;
+    tooLarge?: boolean;
+    truncated?: boolean;
+  } {
+    const data =
+      typeof payload === "object" && payload !== null
+        ? (payload as Record<string, unknown>)
+        : {};
+    const content = typeof data.content === "string" ? data.content : undefined;
+
+    if (typeof data.sizeBytes === "number") {
+      return {
+        path: typeof data.path === "string" ? data.path : path,
+        sizeBytes: data.sizeBytes,
+        totalLines:
+          typeof data.totalLines === "number"
+            ? data.totalLines
+            : content !== undefined
+              ? this.countLines(content)
+              : 0,
+        ...(content !== undefined ? { content } : {}),
+        ...(typeof data.startLine === "number"
+          ? { startLine: data.startLine }
+          : range
+            ? { startLine: range[0] }
+            : {}),
+        ...(data.tooLarge === true ? { tooLarge: true } : {}),
+        ...(data.truncated === true ? { truncated: true } : {}),
+      };
+    }
+
+    if (content === undefined) {
+      throw new Error("Desktop file bridge returned an invalid read payload");
+    }
+
+    const lines = content.split("\n");
+    const selectedContent = range
+      ? lines
+          .slice(range[0] - 1, range[1] === -1 ? undefined : range[1])
+          .join("\n")
+      : content;
+
+    return {
+      path,
+      sizeBytes: new TextEncoder().encode(content).byteLength,
+      totalLines: this.countLines(content),
+      content: selectedContent,
+      startLine: range?.[0] ?? 1,
+    };
+  }
+
+  private async handleFileStat(message: FileStatMessage): Promise<void> {
+    const reply = this.fileReplyPublisher();
+    const { requestId, path } = message;
+    try {
+      const payload = await this.callDesktopFileBridge<{
+        kind: "file" | "not_file" | "missing";
+        path: string;
+        sizeBytes?: number;
+      }>("file_stat", "/files/stat", { path });
+      if (
+        typeof payload.path !== "string" ||
+        (payload.kind !== "file" &&
+          payload.kind !== "not_file" &&
+          payload.kind !== "missing")
+      ) {
+        throw new DesktopFileBridgeError(
+          "invalid_response",
+          "Desktop file bridge returned an invalid stat payload",
+        );
+      }
+      if (payload.kind === "file" && typeof payload.sizeBytes !== "number") {
+        throw new DesktopFileBridgeError(
+          "invalid_response",
+          "Desktop file bridge returned an invalid stat payload",
+        );
+      }
+      await reply({
+        type: "file_stat_result",
+        requestId,
+        kind: payload.kind,
+        path: payload.path,
+        ...(payload.kind === "file" ? { sizeBytes: payload.sizeBytes } : {}),
+      });
+    } catch (error) {
+      await this.publishFileError(requestId, error, reply);
+    }
+  }
+
+  private async handleFileRead(message: FileReadMessage): Promise<void> {
+    const reply = this.fileReplyPublisher();
+    const { requestId, path, range, maxFullBytes, maxResultBytes } = message;
+    try {
+      const payload = await this.callDesktopFileBridge<unknown>(
+        "file_read",
+        "/files/read",
+        {
+          path,
+          range_start: range?.[0],
+          range_end: range?.[1],
+          max_full_bytes: maxFullBytes,
+          max_result_bytes: maxResultBytes,
+        },
+      );
+      await reply({
+        type: "file_read_result",
+        requestId,
+        ...this.normalizeReadPayload(path, payload, range),
+      });
+    } catch (error) {
+      await this.publishFileError(requestId, error, reply);
+    }
+  }
+
+  private async handleFileWrite(message: FileWriteMessage): Promise<void> {
+    const reply = this.fileReplyPublisher();
+    const { requestId, path, content, isBase64, allowedRoot } = message;
+    try {
+      await this.callDesktopFileBridge("file_write", "/files/write", {
+        path,
+        content,
+        is_base64: Boolean(isBase64),
+        allowed_root: allowedRoot,
+      });
+      await reply({ type: "file_ok", requestId });
+    } catch (error) {
+      await this.publishFileError(requestId, error, reply);
+    }
+  }
+
+  private async handleFileAppend(message: FileAppendMessage): Promise<void> {
+    const reply = this.fileReplyPublisher();
+    const { requestId, path, content, isBase64, allowedRoot } = message;
+    try {
+      await this.callDesktopFileBridge("file_append", "/files/append", {
+        path,
+        content,
+        is_base64: Boolean(isBase64),
+        allowed_root: allowedRoot,
+      });
+      await reply({ type: "file_ok", requestId });
+    } catch (error) {
+      await this.publishFileError(requestId, error, reply);
+    }
+  }
+
+  private async handleFileRemove(message: FileRemoveMessage): Promise<void> {
+    const reply = this.fileReplyPublisher();
+    const { requestId, path } = message;
+    try {
+      await this.callDesktopFileBridge("file_remove", "/files/remove", {
+        path,
+      });
+      await reply({ type: "file_ok", requestId });
+    } catch (error) {
+      await this.publishFileError(requestId, error, reply);
+    }
+  }
+
+  private async handleFileList(message: FileListMessage): Promise<void> {
+    const reply = this.fileReplyPublisher();
+    const { requestId, path } = message;
+    try {
+      const entries = await this.callDesktopFileBridge<Array<{ name: string }>>(
+        "file_list",
+        "/files/list",
+        { path },
+      );
+      await reply({
+        type: "file_list_result",
+        requestId,
+        entries,
+      });
+    } catch (error) {
+      await this.publishFileError(requestId, error, reply);
+    }
+  }
+
+  private async handleCommandCancel(
+    command: CommandCancelMessage,
+  ): Promise<void> {
+    // Cancellation is idempotent: if the command already left the active set,
+    // there is no process left to terminate.
+    let canceled = !this.activeCommands.has(command.commandId);
+    if (this.activeCommands.has(command.commandId)) {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        canceled = await invoke<boolean>("cancel_stream_command", {
+          commandId: command.commandId,
+        });
+      } catch (error) {
+        console.error(
+          "[desktop-bridge]",
+          JSON.stringify({
+            event: "desktop_stream_command_cancel_failed",
+            service: "desktop_bridge",
+            command_id: command.commandId,
+            error_name: error instanceof Error ? error.name : "UnknownError",
+          }),
+        );
+      }
+    }
+
+    await this.publishResult({
+      type: "command_cancel_result",
+      commandId: command.commandId,
+      canceled,
+    });
+    if (canceled) this.acknowledgedOutputs.get(command.commandId)?.cancel();
+  }
+
+  private async forwardChunk(
+    commandId: string,
+    chunk: StreamChunk,
+    sequence?: number,
+  ): Promise<void> {
+    const sequenceField = sequence === undefined ? {} : { sequence };
+    switch (chunk.type) {
+      case "stdout":
+        if (chunk.data) {
+          await this.publishResult({
+            type: "stdout",
+            commandId,
+            data: chunk.data,
+            ...sequenceField,
+          });
+        }
+        break;
+      case "stderr":
+        if (chunk.data) {
+          await this.publishResult({
+            type: "stderr",
+            commandId,
+            data: chunk.data,
+            ...sequenceField,
+          });
+        }
+        break;
+      case "exit":
+        if (chunk.exitCode === undefined) {
+          console.warn(
+            "[desktop-bridge]",
+            JSON.stringify({
+              event: "desktop_stream_exit_code_missing",
+              service: "desktop_bridge",
+              command_id: commandId,
+            }),
+          );
+        }
+        await this.publishResult({
+          type: "exit",
+          commandId,
+          exitCode: chunk.exitCode ?? -1,
+          ...sequenceField,
+        });
+        break;
+      case "error":
+        console.error(
+          "[desktop-bridge]",
+          JSON.stringify({
+            event: "desktop_stream_error_chunk_received",
+            service: "desktop_bridge",
+            command_id: commandId,
+            message: chunk.message || "Unknown error",
+          }),
+        );
+        await this.publishResult({
+          type: "error",
+          commandId,
+          message: chunk.message || "Unknown error",
+          ...sequenceField,
+        });
+        break;
+    }
+  }
+
+  private async forwardChunkWithRetry(
+    commandId: string,
+    chunk: StreamChunk,
+    sequence: number,
+    recoveryState: DesktopStreamPublishRecoveryState,
+    recoveryDeadlineAt: number,
+    telemetryContext: DesktopStreamTelemetryContext,
+    canPublish: () => boolean,
+  ): Promise<void> {
+    let firstFailureAt: number | null = null;
+    let firstFailureReason: DesktopStreamPublishFailureReason | null = null;
+
+    for (
+      let attempt = 1;
+      attempt <= DESKTOP_STREAM_PUBLISH_MAX_ATTEMPTS;
+      attempt++
+    ) {
+      if (!canPublish()) return;
+
+      try {
+        // The Desktop socket can reconnect before the worker. With broker
+        // history disabled, flushing in that gap loses output despite publish
+        // succeeding. Keep recovery bounded by the existing delivery deadline.
+        if (
+          (recoveryState.failureReported ||
+            this.successfulRelayConnections !==
+              recoveryState.initialRelayGeneration) &&
+          this.operationRouter &&
+          !(await this.operationRouter
+            .hasCommandReceiver(commandId)
+            .catch((error: unknown) => {
+              if (classifyDesktopStreamPublishFailure(error)) throw error;
+              // An inconclusive lookup is never proof of a receiver. Retain
+              // output and retry within the same bounded delivery window.
+              return false;
+            }))
+        ) {
+          throw {
+            code: errorCodes.timeout,
+            message: "Command receiver has not rejoined",
+          };
+        }
+        if (!canPublish()) return;
+        await this.forwardChunk(commandId, chunk, sequence);
+        if (!canPublish()) return;
+        recoveryState.publishedChunks += 1;
+        if (chunk.type === "exit" || chunk.type === "error") {
+          recoveryState.terminalChunkPublished = true;
+        }
+        if (
+          firstFailureAt !== null &&
+          firstFailureReason !== null &&
+          !recoveryState.recoveryReported
+        ) {
+          recoveryState.recoveryReported = true;
+          const recoveryLatencyMs = Date.now() - firstFailureAt;
+          console.info(
+            JSON.stringify({
+              timestamp: new Date().toISOString(),
+              level: "info",
+              event: "desktop_stream_publish_recovered",
+              service: "desktop_bridge",
+              environment: process.env.NODE_ENV ?? "unknown",
+              request_id: commandId,
+              connection_id: this.connectionId,
+              command_id: commandId,
+              chat_id: telemetryContext.chatId,
+              trigger_run_id: telemetryContext.triggerRunId,
+              chunk_type: chunk.type,
+              reason: firstFailureReason,
+              attempts: attempt,
+              recovery_latency_ms: recoveryLatencyMs,
+            }),
+          );
+          captureAuthenticatedEvent("desktop_stream_publish_recovered", {
+            connectionId: this.connectionId,
+            commandId,
+            ...(telemetryContext.chatId && {
+              chatId: telemetryContext.chatId,
+            }),
+            ...(telemetryContext.triggerRunId && {
+              triggerRunId: telemetryContext.triggerRunId,
+            }),
+            chunkType: chunk.type,
+            reason: firstFailureReason,
+            attempts: attempt,
+            recoveryLatencyMs,
+          });
+        }
+        return;
+      } catch (error) {
+        if (!canPublish()) return;
+        const reason = classifyDesktopStreamPublishFailure(error);
+        if (!reason) throw error;
+
+        firstFailureAt ??= Date.now();
+        firstFailureReason ??= reason;
+
+        if (!recoveryState.failureReported) {
+          recoveryState.failureReported = true;
+          console.warn(
+            JSON.stringify({
+              timestamp: new Date().toISOString(),
+              level: "warn",
+              event: "desktop_stream_publish_failed",
+              service: "desktop_bridge",
+              environment: process.env.NODE_ENV ?? "unknown",
+              request_id: commandId,
+              connection_id: this.connectionId,
+              command_id: commandId,
+              chat_id: telemetryContext.chatId,
+              trigger_run_id: telemetryContext.triggerRunId,
+              chunk_type: chunk.type,
+              reason,
+              attempt,
+              max_attempts: DESKTOP_STREAM_PUBLISH_MAX_ATTEMPTS,
+            }),
+          );
+          captureAuthenticatedEvent("desktop_stream_publish_failed", {
+            connectionId: this.connectionId,
+            commandId,
+            ...(telemetryContext.chatId && {
+              chatId: telemetryContext.chatId,
+            }),
+            ...(telemetryContext.triggerRunId && {
+              triggerRunId: telemetryContext.triggerRunId,
+            }),
+            chunkType: chunk.type,
+            reason,
+            attempt,
+            maxAttempts: DESKTOP_STREAM_PUBLISH_MAX_ATTEMPTS,
+          });
+        }
+
+        if (
+          attempt < DESKTOP_STREAM_PUBLISH_MAX_ATTEMPTS &&
+          Date.now() < recoveryDeadlineAt
+        ) {
+          await this.waitForRelayReady(attempt, recoveryDeadlineAt);
+          if (!canPublish()) return;
+          if (Date.now() < recoveryDeadlineAt) continue;
+        }
+
+        recoveryState.exhaustedChunks += 1;
+        if (!recoveryState.exhaustionReported) {
+          recoveryState.exhaustionReported = true;
+          const recoveryLatencyMs = Date.now() - firstFailureAt;
+          const exhaustionReason =
+            Date.now() >= recoveryDeadlineAt ? "deadline" : "attempts";
+          console.error(
+            JSON.stringify({
+              timestamp: new Date().toISOString(),
+              level: "error",
+              event: "desktop_stream_publish_recovery_exhausted",
+              service: "desktop_bridge",
+              environment: process.env.NODE_ENV ?? "unknown",
+              request_id: commandId,
+              connection_id: this.connectionId,
+              command_id: commandId,
+              chat_id: telemetryContext.chatId,
+              trigger_run_id: telemetryContext.triggerRunId,
+              chunk_type: chunk.type,
+              reason: firstFailureReason,
+              attempts: attempt,
+              exhaustion_reason: exhaustionReason,
+              recovery_latency_ms: recoveryLatencyMs,
+            }),
+          );
+          captureAuthenticatedEvent(
+            "desktop_stream_publish_recovery_exhausted",
+            {
+              connectionId: this.connectionId,
+              commandId,
+              ...(telemetryContext.chatId && {
+                chatId: telemetryContext.chatId,
+              }),
+              ...(telemetryContext.triggerRunId && {
+                triggerRunId: telemetryContext.triggerRunId,
+              }),
+              chunkType: chunk.type,
+              reason: firstFailureReason,
+              attempts: attempt,
+              exhaustionReason,
+              recoveryLatencyMs,
+            },
+          );
+        }
+        throw error;
+      }
+    }
+  }
+
+  private async waitForRelayReady(
+    attempt: number,
+    recoveryDeadlineAt: number,
+  ): Promise<void> {
+    const remainingBeforeBackoffMs = Math.max(
+      0,
+      recoveryDeadlineAt - Date.now(),
+    );
+    const backoffMs = Math.min(
+      DESKTOP_STREAM_PUBLISH_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1),
+      remainingBeforeBackoffMs,
+    );
+    if (backoffMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+    }
+    if (this.isStoppingOrStopped) return;
+
+    const readyTimeoutMs = Math.min(
+      DESKTOP_STREAM_RECONNECT_WAIT_MS,
+      Math.max(0, recoveryDeadlineAt - Date.now()),
+    );
+    if (readyTimeoutMs <= 0) return;
+
+    const readyChecks = [
+      this.client?.ready(readyTimeoutMs),
+      this.subscription?.ready(readyTimeoutMs),
+    ].filter((promise): promise is Promise<void> => Boolean(promise));
+    await Promise.allSettled(readyChecks);
+  }
+
+  private async publishResult(message: SandboxMessage): Promise<void> {
+    if (this.isStoppingOrStopped) return;
+    if (!this.publishQueue) {
+      throw new Error(
+        "[DesktopSandboxBridge] Cannot publish result: subscription is null",
+      );
+    }
+    try {
+      const queue = this.publishQueue;
+      const subscription = this.subscription;
+      const payload = message as unknown as Record<string, unknown>;
+      if (this.operationRouter) {
+        await this.operationRouter.publish(payload, (value) =>
+          subscription!.publish(value),
+        );
+      } else {
+        await queue.publish(payload);
+      }
+    } catch (error) {
+      if (
+        !(error instanceof RelayOutputOverflowError) &&
+        !classifyDesktopStreamPublishFailure(error)
+      ) {
+        console.error(
+          "[DesktopSandboxBridge] Failed to publish result:",
+          error,
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async handlePtyCreate(msg: PtyCreateMessage): Promise<void> {
+    const { sessionId, command, cols, rows, cwd, env } = msg;
+    const router = this.operationRouter;
+    const subscription = this.subscription;
+
+    try {
+      const { invoke, Channel } = await import("@tauri-apps/api/core");
+
+      const channel = new Channel<string>();
+      let ready = false;
+      const pendingChunks: string[] = [];
+      let pendingBytes = 0;
+      let failed = false;
+      const failOutput = () => {
+        if (failed) return;
+        failed = true;
+        pendingChunks.length = 0;
+        pendingBytes = 0;
+        ptyBuffer = "";
+        if (ptyDebounceTimer) clearTimeout(ptyDebounceTimer);
+        ptyDebounceTimer = null;
+        router?.failOutput({ sessionId }, (value) =>
+          subscription!.publish(value),
+        );
+      };
+      // publishResult synchronously admits to the bounded operation queue;
+      // another promise chain here would retain output outside that budget.
+      const enqueuePublish = (message: SandboxMessage) => {
+        if (failed || this.operationRouter !== router) return;
+        void this.publishResult(message).catch((error) => {
+          if (error instanceof RelayOutputOverflowError) failOutput();
+          else
+            console.error(
+              "[DesktopSandboxBridge] Failed to publish PTY output",
+            );
+        });
+      };
+
+      // Debounce buffer for PTY output - accumulate chunks before publishing
+      // to reduce RPC overhead from node-pty's per-character callbacks.
+      const PTY_DEBOUNCE_MS = 8;
+      let ptyBuffer = "";
+      let ptyDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const flushPtyBuffer = () => {
+        if (ptyBuffer) {
+          enqueuePublish({
+            type: "pty_data",
+            sessionId,
+            data: ptyBuffer,
+          });
+          ptyBuffer = "";
+        }
+        ptyDebounceTimer = null;
+      };
+
+      const forwardPtyChunk = (chunk: string) => {
+        if (
+          failed ||
+          this.isStoppingOrStopped ||
+          this.operationRouter !== router
+        )
+          return;
+        // The Tauri PTY backend sends raw output strings and a final JSON
+        // exit sentinel: {"type":"exit","exitCode":N,"sessionId":"..."}.
+        // We require ALL three sentinel fields before treating a chunk as an
+        // exit — otherwise a program that legitimately prints
+        // `{"type":"exit",...}` would be swallowed and never reach pty_data.
+        try {
+          const parsed = JSON.parse(chunk) as {
+            type?: unknown;
+            exitCode?: unknown;
+            sessionId?: unknown;
+          };
+          if (
+            parsed.type === "exit" &&
+            parsed.sessionId === sessionId &&
+            typeof parsed.exitCode === "number"
+          ) {
+            // Flush any buffered data before exit
+            if (ptyDebounceTimer) {
+              clearTimeout(ptyDebounceTimer);
+              flushPtyBuffer();
+            }
+            enqueuePublish({
+              type: "pty_exit",
+              sessionId,
+              exitCode: parsed.exitCode,
+            });
+            return;
+          }
+        } catch {
+          // Not JSON — regular PTY output
+        }
+
+        // Accumulate chunks and debounce publish
+        ptyBuffer += chunk;
+        if (ptyBuffer.length >= 16 * 1024) {
+          if (ptyDebounceTimer) clearTimeout(ptyDebounceTimer);
+          flushPtyBuffer();
+        } else if (!ptyDebounceTimer) {
+          ptyDebounceTimer = setTimeout(flushPtyBuffer, PTY_DEBOUNCE_MS);
+        }
+      };
+
+      channel.onmessage = (chunk: string) => {
+        if (
+          failed ||
+          this.isStoppingOrStopped ||
+          this.operationRouter !== router
+        )
+          return;
+        if (!ready) {
+          const bytes = new TextEncoder().encode(chunk).byteLength;
+          if (
+            pendingChunks.length >= RELAY_QUEUE_MAX_MESSAGES ||
+            pendingBytes + bytes > RELAY_QUEUE_MAX_BYTES
+          ) {
+            failOutput();
+            return;
+          }
+          pendingBytes += bytes;
+          pendingChunks.push(chunk);
+        } else forwardPtyChunk(chunk);
+      };
+
+      const result = (await invoke("execute_pty_create", {
+        sessionId,
+        command,
+        cols: cols ?? DEFAULT_PTY_COLS,
+        rows: rows ?? DEFAULT_PTY_ROWS,
+        cwd,
+        env,
+        onData: channel,
+      })) as { pid: number | null; session_id: string };
+
+      if (
+        failed ||
+        this.isStoppingOrStopped ||
+        this.operationRouter !== router
+      ) {
+        // Creation may have registered the process after the first kill attempt.
+        await invoke("execute_pty_kill", { sessionId });
+        return;
+      }
+
+      // Rust's PtyCreateResult.pid is Option<u32> — serializes to `null` when
+      // the child didn't expose a pid. Reject that case explicitly so the
+      // server doesn't get a pty_ready with a bogus pid cast.
+      if (typeof result.pid !== "number") {
+        throw new Error(
+          `execute_pty_create returned no pid for sessionId=${sessionId}`,
+        );
+      }
+
+      // Native output can arrive before invoke resolves. Announce readiness
+      // first: an early exit otherwise closes the route before pty_ready.
+      enqueuePublish({
+        type: "pty_ready",
+        sessionId,
+        pid: result.pid,
+      });
+      ready = true;
+      for (const chunk of pendingChunks) forwardPtyChunk(chunk);
+      pendingChunks.length = 0;
+      pendingBytes = 0;
+    } catch (err) {
+      // The failure path never reaches the channel.onmessage listener, so
+      // no pty_data was queued for this session — publishResult direct is
+      // safe here. (enqueuePublish is also out of scope in this catch.)
+      await this.publishResult({
+        type: "pty_error",
+        sessionId,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private async handlePtyInput(msg: PtyInputMessage): Promise<void> {
+    const { sessionId, data } = msg;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("execute_pty_input", { sessionId, data });
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : typeof err === "string"
+            ? err
+            : JSON.stringify(err) || "unknown pty_input error";
+      console.error("[desktop-bridge] execute_pty_input failed:", err);
+      await this.publishResult({
+        type: "pty_error",
+        sessionId,
+        message,
+      });
+    }
+  }
+
+  private async handlePtyResize(msg: PtyResizeMessage): Promise<void> {
+    const { sessionId, cols, rows } = msg;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("execute_pty_resize", { sessionId, cols, rows });
+    } catch (err) {
+      console.warn(
+        `[DesktopSandboxBridge] pty_resize failed sessionId=${sessionId}:`,
+        err,
+      );
+    }
+  }
+
+  private async handlePtyKill(msg: PtyKillMessage): Promise<void> {
+    const { sessionId } = msg;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("execute_pty_kill", { sessionId });
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : typeof err === "string"
+            ? err
+            : JSON.stringify(err) || "unknown pty_kill error";
+      console.error("[desktop-bridge] execute_pty_kill failed:", err);
+      // Surface the failure to the server so the adapter's failTransport()
+      // path can resolve `exited` — otherwise awaiters of handle.exited
+      // would only escape via the 1500ms kill-timeout fallback.
+      await this.publishResult({
+        type: "pty_error",
+        sessionId,
+        message,
+      });
+    }
+  }
+
+  async stop(): Promise<void> {
+    this.startupGeneration += 1;
+    this.commandOutputStopSource = "bridge_stop";
+    this.isStoppingOrStopped = true;
+    for (const stream of this.acknowledgedOutputs.values()) stream.stop();
+    this.ackTelemetry.dispose();
+    this.acknowledgedOutputs.clear();
+    this.commandDeliveryDeadlines.clear();
+    for (const timer of this.commandDeliveryCleanupTimers) clearTimeout(timer);
+    this.commandDeliveryCleanupTimers.clear();
+    this.stopHeartbeat();
+    this.relayStarted = false;
+    this.clearReconnectTimer();
+    if (!this.config.relayTelemetry) {
+      this.relayTelemetry.flush();
+      this.relayTelemetry.reset();
+    }
+    this.publishQueue?.close();
+    this.publishQueue = null;
+    this.operationRouter?.stop();
+    this.operationRouter = null;
+    const connectionId = this.connectionId;
+    this.connectionId = null;
+
+    if (this.subscription) {
+      try {
+        this.subscription.unsubscribe();
+        this.subscription.removeAllListeners();
+      } catch (error) {
+        console.warn("[DesktopSandboxBridge] Failed to unsubscribe:", error);
+      }
+      this.subscription = null;
+    }
+
+    if (this.client) {
+      try {
+        this.client.disconnect();
+      } catch (error) {
+        console.warn(
+          "[DesktopSandboxBridge] Failed to disconnect client:",
+          error,
+        );
+      }
+      this.client = null;
+    }
+
+    // Convex queues mutations while offline. Local cleanup and recovery must
+    // never wait for that network request to settle.
+    if (connectionId) {
+      void this.config.disconnectDesktop({ connectionId }).catch((error) => {
+        console.warn("[DesktopSandboxBridge] Failed to disconnect:", error);
+      });
+    }
+  }
+}

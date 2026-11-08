@@ -1,0 +1,350 @@
+import { ToolLoopObserver } from "../tool-loop-observer";
+
+const tools = new Set([
+  "file",
+  "file_edit",
+  "file_write",
+  "run_terminal_cmd",
+  "open_url",
+  "interact_terminal_session",
+  "wait_for_agents",
+]);
+const observe = (
+  observer: ToolLoopObserver,
+  input: unknown = { path: "/private" },
+  output: unknown = "unchanged",
+  toolName = "file",
+) =>
+  observer.observe(
+    [{ toolCallId: "call", toolName, input }],
+    [{ toolCallId: "call", output }],
+    tools,
+  );
+
+describe("ToolLoopObserver", () => {
+  it("reports identical results at three and five laps without retaining content", () => {
+    const observer = new ToolLoopObserver();
+    const events = Array.from({ length: 10 }, () => observe(observer));
+    expect(events.filter(Boolean)).toEqual([
+      { toolNames: ["file"], repeatCount: 3, cycleLength: 1 },
+      { toolNames: ["file"], repeatCount: 5, cycleLength: 1 },
+    ]);
+    expect(JSON.stringify(observer)).not.toContain("/private");
+    expect(JSON.stringify(observer)).not.toContain("unchanged");
+  });
+
+  it.each(["file", "file_edit", "file_write"])(
+    "identifies confirmed validation failure for %s without treating unknown errors as safe",
+    (toolName) => {
+      const observer = new ToolLoopObserver();
+      const rejected = {
+        error: "text is required for write action",
+        executionOutcome: "not_executed",
+      };
+      for (let i = 0; i < 3; i++)
+        observe(
+          observer,
+          { action: "write", path: "/private" },
+          rejected,
+          toolName,
+        );
+      expect(observer.getCurrentCycle()).toEqual({
+        toolNames: [toolName],
+        repeatCount: 3,
+        cycleLength: 1,
+        confirmedNonExecution: true,
+        toolCallCount: 1,
+      });
+      observe(
+        observer,
+        { action: "write", path: "/private" },
+        { error: "transport error" },
+        toolName,
+      );
+      expect(observer.getCurrentCycle()).toBeUndefined();
+      expect(JSON.stringify(observer)).not.toContain("/private");
+    },
+  );
+
+  it.each([2, 3, 4])("detects repeating %i-step cycles", (period) => {
+    const observer = new ToolLoopObserver();
+    let result;
+    for (let i = 0; i < period * 3; i++) {
+      result = observe(
+        observer,
+        { path: `/${i % period}` },
+        `result ${i % period}`,
+      );
+    }
+    expect(result).toEqual({
+      toolNames: ["file"],
+      repeatCount: 3,
+      cycleLength: period,
+    });
+  });
+
+  it.each([2, 3, 4])(
+    "reports each threshold only once as a %i-step cycle rotates",
+    (period) => {
+      const observer = new ToolLoopObserver();
+      const events = [];
+      for (let i = 0; i < period * 6 - 1; i++) {
+        const event = observe(
+          observer,
+          { path: `/${i % period}` },
+          `result ${i % period}`,
+        );
+        if (event) events.push({ step: i + 1, laps: event.repeatCount });
+      }
+      expect(events).toEqual([
+        { step: period * 3, laps: 3 },
+        { step: period * 5, laps: 5 },
+      ]);
+      // New evidence breaks the cycle and permits a new three-lap warning.
+      observe(observer, { path: "/new" }, "new evidence");
+      let resumed;
+      for (let i = 0; i < period * 3; i++)
+        resumed = observe(
+          observer,
+          { path: `/${i % period}` },
+          `result ${i % period}`,
+        );
+      expect(resumed?.repeatCount).toBe(3);
+    },
+  );
+
+  it("detects alternating failed commands despite fresh terminal sessions", () => {
+    const observer = new ToolLoopObserver();
+    let result;
+    for (let i = 0; i < 6; i++) {
+      result = observe(
+        observer,
+        { command: i % 2 ? "check-b" : "check-a" },
+        {
+          result: {
+            output: "missing fixture dependency",
+            exitCode: 2,
+            status: "failed",
+            session: `session-${i}`,
+            recordPath: `/records/session-${i}.json`,
+            pid: 100 + i,
+            rawSnapshot: `replay-${i}`,
+            callTiming: { startedAt: `time-${i}`, elapsedMs: i * 100 },
+            executionEnvironment: "cloud",
+            workingDirectory: "/home/user",
+          },
+        },
+        "run_terminal_cmd",
+      );
+    }
+    expect(result).toEqual({
+      toolNames: ["run_terminal_cmd"],
+      repeatCount: 3,
+      cycleLength: 2,
+    });
+  });
+
+  it.each([
+    "output",
+    "exitCode",
+    "status",
+    "executionEnvironment",
+    "workingDirectory",
+  ])("preserves changing terminal %s as possible progress", (field) => {
+    const observer = new ToolLoopObserver();
+    for (let i = 0; i < 6; i++) {
+      expect(
+        observe(
+          observer,
+          { command: "check" },
+          {
+            result: {
+              output: "unchanged",
+              exitCode: 0,
+              status: "completed",
+              executionEnvironment: "cloud",
+              workingDirectory: "/home/user",
+              [field]: String(i),
+              session: `session-${i}`,
+            },
+          },
+          "run_terminal_cmd",
+        ),
+      ).toBeUndefined();
+    }
+  });
+
+  it("detects mixed terminal steps despite fresh timing on interactive results", () => {
+    const observer = new ToolLoopObserver();
+    let observation;
+    for (let i = 0; i < 3; i++) {
+      observation = observer.observe(
+        [
+          {
+            toolCallId: "exec",
+            toolName: "run_terminal_cmd",
+            input: { command: "check" },
+          },
+          {
+            toolCallId: "view",
+            toolName: "interact_terminal_session",
+            input: { action: "view", session: "existing" },
+          },
+        ],
+        [
+          {
+            toolCallId: "exec",
+            output: {
+              result: {
+                output: "unchanged",
+                exitCode: 1,
+                callTiming: { elapsedMs: i },
+              },
+            },
+          },
+          {
+            toolCallId: "view",
+            output: {
+              result: {
+                output: "unchanged",
+                callTiming: { startedAt: String(i), elapsedMs: i * 10 },
+              },
+            },
+          },
+        ],
+        tools,
+      );
+    }
+    expect(observation).toEqual({
+      toolNames: ["run_terminal_cmd", "interact_terminal_session"],
+      repeatCount: 3,
+      cycleLength: 1,
+    });
+  });
+
+  it("does not confuse changed output with stalled work", () => {
+    const observer = new ToolLoopObserver();
+    for (let i = 0; i < 20; i++)
+      expect(observe(observer, {}, `new result ${i}`)).toBeUndefined();
+  });
+
+  it("preserves normal edit/test cycles with changing edits", () => {
+    const observer = new ToolLoopObserver();
+    for (let i = 0; i < 10; i++) {
+      expect(
+        observe(
+          observer,
+          { action: "edit", content: `revision ${i}` },
+          "saved",
+        ),
+      ).toBeUndefined();
+      expect(
+        observe(
+          observer,
+          { command: "test" },
+          "test failed",
+          "run_terminal_cmd",
+        ),
+      ).toBeUndefined();
+    }
+  });
+
+  it.each(["interact_terminal_session", "wait_for_agents"])(
+    "exempts %s polling and does not join history across polls",
+    (tool) => {
+      const observer = new ToolLoopObserver();
+      for (let i = 0; i < 10; i++) {
+        expect(observe(observer)).toBeUndefined();
+        expect(observe(observer, {}, "running", tool)).toBeUndefined();
+      }
+    },
+  );
+
+  it("matches results by call ID and canonicalizes object keys and batch order", () => {
+    const observer = new ToolLoopObserver();
+    const a = {
+      toolCallId: "a",
+      toolName: "file",
+      input: { path: "/a", action: "read", brief: "first" },
+    };
+    const b = { toolCallId: "b", toolName: "file", input: { path: "/b" } };
+    const results = [
+      { toolCallId: "b", output: "b" },
+      { toolCallId: "a", output: "a" },
+    ];
+    observer.observe([a, b], results, tools);
+    observer.observe(
+      [b, { ...a, input: { brief: "second", action: "read", path: "/a" } }],
+      results,
+      tools,
+    );
+    expect(observer.observe([a, b], results, tools)?.repeatCount).toBe(3);
+  });
+
+  it("breaks history when a result is missing or a name is not a registered tool", () => {
+    const observer = new ToolLoopObserver();
+    observe(observer);
+    observe(observer);
+    expect(
+      observer.observe(
+        [{ toolCallId: "call", toolName: "file", input: {} }],
+        [],
+        tools,
+      ),
+    ).toBeUndefined();
+    expect(observe(observer)).toBeUndefined();
+    expect(
+      observe(observer, {}, "result", "private-model-invented-name"),
+    ).toBeUndefined();
+    expect(JSON.stringify(observer)).not.toContain(
+      "private-model-invented-name",
+    );
+    expect(observe(observer)).toBeUndefined();
+  });
+
+  it("skips oversized, cyclic, and non-JSON results without throwing", () => {
+    const observer = new ToolLoopObserver();
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    for (const result of [
+      "x".repeat(70_000),
+      cyclic,
+      new Error("private error"),
+      undefined,
+      BigInt(1),
+    ]) {
+      expect(observe(observer, {}, result)).toBeUndefined();
+    }
+  });
+
+  it("keeps arrays distinct from object entries", () => {
+    const observer = new ToolLoopObserver();
+    observe(observer, {}, { a: 1 });
+    observe(observer, {}, [["a", 1]]);
+    expect(observe(observer, {}, { a: 1 })).toBeUndefined();
+  });
+
+  it.each([new Date(0), new Map(), new Set(), Object.create(null)])(
+    "breaks observation for non-plain inputs instead of converting them to empty objects",
+    (input) => {
+      const observer = new ToolLoopObserver();
+      observe(observer, {});
+      observe(observer, {});
+      expect(observe(observer, input)).toBeUndefined();
+      expect(observe(observer, {})).toBeUndefined();
+      expect(observe(observer, {})).toBeUndefined();
+      expect(observe(observer, {})?.repeatCount).toBe(3);
+    },
+  );
+
+  it("caps telemetry and retained history over long runs", () => {
+    const observer = new ToolLoopObserver();
+    for (let i = 0; i < 1_000; i++) observe(observer, { i }, "output");
+    expect(JSON.stringify(observer).length).toBeLessThan(4_000);
+    expect(observer.shouldReport("loop", "observe", 3)).toBe(true);
+    expect(observer.shouldReport("loop", "observe", 3)).toBe(false);
+    for (let i = 0; i < 15; i++)
+      expect(observer.shouldReport(`reason-${i}`, "halt", 1)).toBe(true);
+    expect(observer.shouldReport("last", "halt", 1)).toBe(false);
+  });
+});

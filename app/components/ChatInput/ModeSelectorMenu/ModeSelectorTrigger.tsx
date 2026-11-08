@@ -1,0 +1,59 @@
+"use client";
+
+import { Button } from "@/components/ui/button";
+import { DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { MessageSquare, Infinity, ChevronDown } from "lucide-react";
+import type { ChatMode } from "@/types/chat";
+
+const FREE_MODE_VARIANT_CLASSES: Record<ChatMode, string> = {
+  ask: "bg-muted hover:bg-muted/50",
+  agent:
+    "bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:bg-red-400/10 dark:text-red-400 dark:hover:bg-red-400/20",
+};
+
+const PAID_MODE_VARIANT_CLASSES: Record<ChatMode, string> = {
+  ask: "bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20 dark:bg-emerald-400/10 dark:text-emerald-400 dark:hover:bg-emerald-400/20",
+  agent: "bg-muted text-foreground hover:bg-muted/50",
+};
+
+const baseClasses =
+  "h-7 gap-0 px-2 text-xs font-medium rounded-md focus-visible:ring-1 shrink-0 max-md:size-8 max-md:p-0 md:gap-2";
+
+export interface ModeSelectorTriggerProps {
+  chatMode: ChatMode;
+  isPaid: boolean;
+}
+
+export function ModeSelectorTrigger({
+  chatMode,
+  isPaid,
+}: ModeSelectorTriggerProps) {
+  const modeVariantClasses = isPaid
+    ? PAID_MODE_VARIANT_CLASSES
+    : FREE_MODE_VARIANT_CLASSES;
+
+  return (
+    <DropdownMenuTrigger asChild>
+      <Button
+        variant="ghost"
+        size="sm"
+        aria-label={`Chat mode: ${chatMode === "agent" ? "Agent" : "Ask"}`}
+        data-testid="mode-selector"
+        className={`${baseClasses} ${modeVariantClasses[chatMode]}`}
+      >
+        {chatMode === "agent" ? (
+          <>
+            <Infinity className="w-3 h-3 md:mr-1" />
+            <span className="hidden md:inline">Agent</span>
+          </>
+        ) : (
+          <>
+            <MessageSquare className="w-3 h-3 md:mr-1" />
+            <span className="hidden md:inline">Ask</span>
+          </>
+        )}
+        <ChevronDown className="hidden w-3 h-3 ml-1 md:block" />
+      </Button>
+    </DropdownMenuTrigger>
+  );
+}

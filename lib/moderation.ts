@@ -1,0 +1,233 @@
+import OpenAI from "openai";
+import { decode } from "gpt-tokenizer";
+import { safeEncode } from "@/lib/token-utils";
+
+const MODERATION_TOKEN_LIMIT = 512;
+
+export type ModerationResult = {
+  shouldUncensorResponse: boolean;
+  allowsFreeAbliteration: boolean;
+  moderationText: string;
+};
+
+const emptyModerationResult = (): ModerationResult => ({
+  shouldUncensorResponse: false,
+  allowsFreeAbliteration: false,
+  moderationText: "",
+});
+
+export async function getModerationResult(
+  messages: any[],
+  isPaidUser: boolean,
+): Promise<ModerationResult> {
+  const openaiApiKey = process.env.OPENAI_API_KEY;
+
+  if (!openaiApiKey) {
+    return emptyModerationResult();
+  }
+
+  const openai = new OpenAI({ apiKey: openaiApiKey });
+
+  // Include recent user context so short follow-ups and authorization
+  // restatements are moderated as continuations of the active request.
+  const targetMessage = findTargetMessage(messages, 30);
+
+  if (!targetMessage) {
+    return emptyModerationResult();
+  }
+
+  const { text: input, truncated: inputTruncated } =
+    prepareInput(targetMessage);
+
+  try {
+    const moderation = await openai.moderations.create({
+      model: "omni-moderation-latest",
+      input: input,
+    });
+
+    // Check if moderation results exist and are not empty
+    if (!moderation?.results || moderation.results.length === 0) {
+      console.error("Moderation API returned no results");
+      return { ...emptyModerationResult(), moderationText: input };
+    }
+
+    const result = moderation.results[0];
+    const moderationLevel = calculateModerationLevel(result.category_scores);
+    const hazardCategories = Object.entries(result.categories)
+      .filter(([, isFlagged]) => isFlagged)
+      .map(([category]) => category);
+
+    const shouldUncensorResponse = determineShouldUncensorResponse(
+      moderationLevel,
+      hazardCategories,
+      isPaidUser,
+    );
+
+    return {
+      shouldUncensorResponse,
+      // Free treatment must not replace baseline refusals for flagged illicit
+      // intent. Partial input or missing categories keep the existing Free route.
+      allowsFreeAbliteration:
+        shouldUncensorResponse &&
+        !inputTruncated &&
+        result.categories.illicit === false &&
+        result.categories["illicit/violent"] === false,
+      moderationText: input,
+    };
+  } catch (_error: any) {
+    return emptyModerationResult();
+  }
+}
+
+function findTargetMessage(messages: any[], minLength: number): any | null {
+  const MIN_FALLBACK_LENGTH = 5;
+  const MAX_CONTEXT_USER_MESSAGES = 3;
+  let combinedContent = "";
+  let userMessagesChecked = 0;
+  const messagesToCombine: any[] = [];
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.role === "user") {
+      userMessagesChecked++;
+      messagesToCombine.push(message);
+
+      // Handle UIMessage format with parts array
+      if (message.parts && Array.isArray(message.parts)) {
+        const textContent = message.parts
+          .filter((part: any) => part.type === "text")
+          .map((part: any) => part.text)
+          .join(" ");
+
+        combinedContent = textContent + " " + combinedContent;
+      }
+
+      if (userMessagesChecked >= MAX_CONTEXT_USER_MESSAGES) {
+        break;
+      }
+    }
+  }
+
+  if (
+    combinedContent.trim().length >= minLength &&
+    messagesToCombine.length > 0
+  ) {
+    return createCombinedMessage(messagesToCombine);
+  }
+
+  // If the combined context is still short, retain the existing fallback.
+  if (
+    combinedContent.trim().length >= MIN_FALLBACK_LENGTH &&
+    messagesToCombine.length > 0
+  ) {
+    return createCombinedMessage(messagesToCombine);
+  }
+
+  return null;
+}
+
+function createCombinedMessage(messages: any[]): any {
+  const combinedParts: any[] = [];
+
+  // Reverse to get chronological order
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.parts && Array.isArray(message.parts)) {
+      const textParts = message.parts.filter(
+        (part: any) => part.type === "text",
+      );
+      combinedParts.push(...textParts);
+    }
+  }
+
+  return {
+    role: "user",
+    parts: combinedParts,
+  };
+}
+
+type ModerationInput = { text: string; truncated: boolean };
+
+function prepareInput(message: any): ModerationInput {
+  // Handle UIMessage format with parts array
+  if (message.parts && Array.isArray(message.parts)) {
+    const textContent = message.parts
+      .filter((part: any) => part.type === "text")
+      .map((part: any) => part.text || "")
+      .join(" ");
+
+    return truncateByTokens(textContent);
+  }
+  // Fallback: Handle legacy string content format
+  else if (typeof message.content === "string") {
+    return truncateByTokens(message.content);
+  }
+  return { text: "", truncated: false };
+}
+
+function truncateByTokens(content: string): ModerationInput {
+  const tokens = safeEncode(content);
+  if (tokens.length <= MODERATION_TOKEN_LIMIT) {
+    return { text: content, truncated: false };
+  }
+
+  // For large inputs, include both beginning and end for better context
+  const halfLimit = Math.floor(MODERATION_TOKEN_LIMIT / 2);
+  const startTokens = tokens.slice(0, halfLimit);
+  const endTokens = tokens.slice(-halfLimit);
+
+  return {
+    text: decode(startTokens) + " [...] " + decode(endTokens),
+    truncated: true,
+  };
+}
+
+function calculateModerationLevel(
+  categoryScores: OpenAI.Moderations.Moderation.CategoryScores,
+): number {
+  const scores = Object.values(categoryScores);
+  if (
+    !scores.length ||
+    scores.some(
+      (score) =>
+        typeof score !== "number" ||
+        !Number.isFinite(score) ||
+        score < 0 ||
+        score > 1,
+    )
+  )
+    return NaN;
+  return Math.max(...scores);
+}
+
+function determineShouldUncensorResponse(
+  moderationLevel: number,
+  hazardCategories: string[],
+  isPaidUser: boolean,
+  minModerationLevel = 0.05,
+): boolean {
+  const forbiddenCategories = [
+    "sexual",
+    "sexual/minors",
+    "hate",
+    "hate/threatening",
+    "harassment",
+    "harassment/threatening",
+    "self-harm",
+    "self-harm/intent",
+    "self-harm/instruction",
+    "violence",
+    "violence/graphic",
+  ];
+  const hasForbiddenCategory = hazardCategories.some((category) =>
+    forbiddenCategories.includes(category),
+  );
+
+  // The same minimum moderation level applies to free and paid users.
+  const maxModerationLevel = 0.98;
+  return (
+    moderationLevel >= minModerationLevel &&
+    moderationLevel <= maxModerationLevel &&
+    !hasForbiddenCategory
+  );
+}

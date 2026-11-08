@@ -1,0 +1,232 @@
+import { NextRequest, NextResponse } from "next/server";
+import { runs, auth, ApiError } from "@trigger.dev/sdk";
+
+import { getUserIDAndPro } from "@/lib/auth/get-user-id";
+import { getChatById, setActiveTriggerRun } from "@/lib/db/actions";
+import { handleAgentRouteError } from "@/lib/api/agent-route-errors";
+import type { AgentApiEndpoint } from "@/lib/api/agent-endpoints";
+import {
+  AGENT_APPROVAL_PROTOCOL_VERSION,
+  AGENT_APPROVAL_TOKEN_EXPIRATION,
+  closeAgentApprovalSession,
+} from "@/lib/api/agent-approval-session";
+import { createAgentRunCorrelationToken } from "@/lib/api/agent-run-correlation";
+
+import { recoverCrashedAgentRun } from "./agent-crash-recovery";
+import { AgentCrashRecoveryReplayLimitError } from "./agent-crash-recovery-error";
+
+const TERMINAL_STATUSES = new Set([
+  "COMPLETED",
+  "CANCELED",
+  "FAILED",
+  "CRASHED",
+  "SYSTEM_FAILURE",
+  "EXPIRED",
+  "TIMED_OUT",
+]);
+
+export const createAgentResumeGet =
+  ({ endpoint }: { endpoint: AgentApiEndpoint }) =>
+  async (req: NextRequest) => {
+    let stage = "authenticate";
+    let userId: string | undefined;
+    let chatId: string | undefined;
+    let runId: string | undefined;
+    let approvalSessionId: string | undefined;
+    const requestId =
+      req.headers.get("x-request-id") ??
+      req.headers.get("x-vercel-id") ??
+      undefined;
+    const requestStartedAt = Date.now();
+    const slowRequestInterval = setInterval(() => {
+      console.warn(
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          level: "warn",
+          event: "agent_resume_slow_request",
+          service: "hackerai-web",
+          environment:
+            process.env.VERCEL_ENV ?? process.env.NODE_ENV ?? "unknown",
+          endpoint,
+          request_id: requestId,
+          user_id: userId,
+          chat_id: chatId,
+          trigger_run_id: runId,
+          stage,
+          elapsed_ms: Date.now() - requestStartedAt,
+        }),
+      );
+    }, 10_000);
+
+    try {
+      const authContext = await getUserIDAndPro(req);
+      userId = authContext.userId;
+
+      stage = "validate_request";
+      chatId = req.nextUrl.searchParams.get("chatId") ?? undefined;
+      if (!chatId) {
+        return new NextResponse("chatId required", { status: 400 });
+      }
+
+      stage = "get_chat";
+      const chat = await getChatById({ id: chatId });
+      if (!chat || chat.user_id !== userId) {
+        return new NextResponse("Forbidden", { status: 403 });
+      }
+      runId = chat.active_trigger_run_id;
+      approvalSessionId = chat.active_agent_approval_session_id;
+      if (!runId) {
+        if (approvalSessionId) {
+          stage = "clear_orphaned_approval_session";
+          await closeAgentApprovalSession(
+            approvalSessionId,
+            "agent-run-missing",
+          );
+          await setActiveTriggerRun({
+            chatId,
+            triggerRunId: null,
+            approvalSessionId: null,
+            expectedApprovalSessionId: approvalSessionId,
+            clearApprovalPending: true,
+          });
+        }
+        return new NextResponse(null, { status: 204 });
+      }
+
+      let runStatus: string | undefined;
+      let runMetadata: unknown;
+      try {
+        stage = "retrieve_trigger_run";
+        const run = await runs.retrieve(runId);
+        runStatus = run.status;
+        runMetadata = run.metadata;
+      } catch (err) {
+        // Only treat a 404 as "run gone" so we self-heal the stored id.
+        // Re-throw transient errors (network, 5xx) to leave the mapping intact.
+        if (err instanceof ApiError && err.status === 404) {
+          runStatus = "EXPIRED";
+        } else {
+          throw err;
+        }
+      }
+
+      if (runStatus && TERMINAL_STATUSES.has(runStatus)) {
+        if (runStatus === "CRASHED") {
+          stage = "recover_crashed_trigger_run";
+          let outcome: "recovered" | "stale";
+          try {
+            outcome = await recoverCrashedAgentRun({
+              chatId,
+              userId,
+              runId,
+              metadata: runMetadata,
+            });
+          } catch (error) {
+            if (!(error instanceof AgentCrashRecoveryReplayLimitError))
+              throw error;
+            console.warn(
+              JSON.stringify({
+                event: "agent_crash_recovery_blocked",
+                service: "hackerai-web",
+                action: "resume",
+                reason: "replay_byte_limit",
+                chat_id: chatId.slice(0, 128),
+                user_id: userId.slice(0, 128),
+                trigger_run_id: runId.slice(0, 128),
+              }),
+            );
+            return NextResponse.json(
+              {
+                code: "bad_request:api",
+                cause:
+                  "This Agent run stopped. Saved messages are preserved, but its remaining output could not be restored automatically.",
+                metadata: { recovery: "blocked" },
+              },
+              { status: 409 },
+            );
+          }
+          if (outcome === "stale")
+            return new NextResponse(null, { status: 409 });
+        }
+        stage = "clear_terminal_trigger_run";
+        await closeAgentApprovalSession(
+          approvalSessionId,
+          "agent-run-terminal",
+        );
+        const detached = await setActiveTriggerRun({
+          chatId,
+          triggerRunId: null,
+          approvalSessionId: null,
+          expectedRunId: runId,
+          ...(runStatus === "CRASHED" ? { recoveredCrash: true } : {}),
+          clearApprovalPending: true,
+        });
+        if (detached === "stale") {
+          // Stop may already have cleared this run while resume was retrieving
+          // its terminal status. There is nothing to resume in that case; keep
+          // a real replacement run distinct from successful cancellation.
+          stage = "reconcile_terminal_trigger_run";
+          const latestChat = await getChatById({ id: chatId });
+          if (!latestChat || latestChat.user_id !== userId) {
+            return new NextResponse("Forbidden", { status: 403 });
+          }
+          return new NextResponse(null, {
+            status: latestChat.active_trigger_run_id ? 409 : 204,
+          });
+        }
+        return new NextResponse(null, { status: 204 });
+      }
+
+      stage = "create_public_token";
+      const [publicAccessToken, approvalSessionPublicAccessToken] =
+        await Promise.all([
+          auth.createPublicToken({
+            scopes: { read: { runs: [runId] } },
+            expirationTime: "6h",
+          }),
+          approvalSessionId
+            ? auth.createPublicToken({
+                scopes: {
+                  write: { sessions: approvalSessionId },
+                } as any,
+                expirationTime: AGENT_APPROVAL_TOKEN_EXPIRATION,
+              })
+            : Promise.resolve(undefined),
+        ]);
+
+      const response = NextResponse.json({
+        runId,
+        runCorrelationToken: createAgentRunCorrelationToken({
+          userId,
+          chatId,
+          runId,
+        }),
+        publicAccessToken,
+        chatId,
+        approvalProtocolVersion: AGENT_APPROVAL_PROTOCOL_VERSION,
+        ...(approvalSessionId && approvalSessionPublicAccessToken
+          ? {
+              approvalSessionId,
+              approvalSessionPublicAccessToken,
+            }
+          : {}),
+      });
+      return response;
+    } catch (error) {
+      return handleAgentRouteError({
+        error,
+        endpoint,
+        action: "resume",
+        fallbackMessage: "Failed to resume run",
+        context: {
+          requestId,
+          userId,
+          chatId,
+          runId,
+          stage,
+        },
+      });
+    } finally {
+      clearInterval(slowRequestInterval);
+    }
+  };

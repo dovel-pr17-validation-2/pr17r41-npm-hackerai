@@ -1,0 +1,211 @@
+import { NextRequest, NextResponse } from "next/server";
+
+import { getUserIDAndPro } from "@/lib/auth/get-user-id";
+import { getChatById, setActiveTriggerRun } from "@/lib/db/actions";
+import { handleAgentRouteError } from "@/lib/api/agent-route-errors";
+import type { AgentApiEndpoint } from "@/lib/api/agent-endpoints";
+import {
+  cancelAgentTriggerRun,
+  closeAgentApprovalSession,
+} from "@/lib/api/agent-approval-session";
+import { logger } from "@/lib/logger";
+
+type AgentCancelRejectionReason =
+  "chat_owner_mismatch" | "chat_missing" | "stale_run";
+
+function logAgentCancelRejection({
+  req,
+  endpoint,
+  userId,
+  chatId,
+  reason,
+}: {
+  req: NextRequest;
+  endpoint: AgentApiEndpoint;
+  userId: string;
+  chatId: string;
+  reason: AgentCancelRejectionReason;
+}) {
+  logger.warn("Rejected Agent cancellation request", {
+    event: "agent_cancel_rejected",
+    request_id: req.headers.get("x-vercel-id") ?? "unknown",
+    service: "hackerai-web",
+    environment: process.env.VERCEL_ENV ?? process.env.NODE_ENV ?? "unknown",
+    route: `${endpoint}/cancel`,
+    endpoint,
+    action: "cancel",
+    reason,
+    status_code: reason === "stale_run" ? 409 : 403,
+    user_id: userId,
+    chat_id: chatId,
+  });
+}
+
+export const createAgentCancelPost =
+  ({ endpoint }: { endpoint: AgentApiEndpoint }) =>
+  async (req: NextRequest) => {
+    let stage:
+      | "read_request"
+      | "authenticate"
+      | "get_chat"
+      | "close_approval_session"
+      | "cancel_trigger_run"
+      | "clear_active_run" = "read_request";
+    let userId: string | undefined;
+    let ownedChat:
+      | { chatId: string; runId?: string; approvalSessionId?: string }
+      | undefined;
+    const requestStartedAt = Date.now();
+    const platformRequestId = req.headers.get("x-vercel-id");
+    const requestId =
+      platformRequestId && /^[A-Za-z0-9:_-]{1,128}$/.test(platformRequestId)
+        ? platformRequestId
+        : "unknown";
+    // A platform hard timeout bypasses catch/finally. Keep the warning budget
+    // at two for the entire request, even when several dependencies are slow.
+    const slowRequestTimers = [10_000, 20_000].map((delay) =>
+      setTimeout(() => {
+        console.warn(
+          JSON.stringify({
+            timestamp: new Date().toISOString(),
+            level: "warn",
+            event: "agent_cancel_slow_request",
+            service: "hackerai-web",
+            environment:
+              process.env.VERCEL_ENV ?? process.env.NODE_ENV ?? "unknown",
+            endpoint,
+            request_id: requestId,
+            user_id: userId,
+            chat_id: ownedChat?.chatId,
+            trigger_run_id: ownedChat?.runId,
+            approval_session_id: ownedChat?.approvalSessionId,
+            stage,
+            elapsed_ms: Date.now() - requestStartedAt,
+          }),
+        );
+      }, delay),
+    );
+    try {
+      let body: { chatId?: string; expectedTriggerRunId?: string };
+      try {
+        body = await req.json();
+      } catch {
+        return new NextResponse("Invalid JSON body", { status: 400 });
+      }
+      const { chatId, expectedTriggerRunId } = body;
+      if (!chatId || typeof chatId !== "string") {
+        return new NextResponse("chatId required", { status: 400 });
+      }
+      if (
+        expectedTriggerRunId !== undefined &&
+        (typeof expectedTriggerRunId !== "string" ||
+          expectedTriggerRunId.length === 0)
+      ) {
+        return new NextResponse("expectedTriggerRunId must be a string", {
+          status: 400,
+        });
+      }
+
+      stage = "authenticate";
+      const authContext = await getUserIDAndPro(req);
+      userId = authContext.userId;
+
+      stage = "get_chat";
+      const chat = await getChatById({ id: chatId });
+      if (chat && chat.user_id !== userId) {
+        logAgentCancelRejection({
+          req,
+          endpoint,
+          userId,
+          chatId,
+          reason: "chat_owner_mismatch",
+        });
+        return new NextResponse("Forbidden", { status: 403 });
+      }
+
+      if (!chat) {
+        logAgentCancelRejection({
+          req,
+          endpoint,
+          userId,
+          chatId,
+          reason: "chat_missing",
+        });
+        return new NextResponse("Forbidden", { status: 403 });
+      }
+
+      const approvalSessionId = chat.active_agent_approval_session_id;
+      const runId = chat.active_trigger_run_id;
+      if (expectedTriggerRunId && runId !== expectedTriggerRunId) {
+        logAgentCancelRejection({
+          req,
+          endpoint,
+          userId,
+          chatId,
+          reason: "stale_run",
+        });
+        return NextResponse.json(
+          {
+            canceled: false,
+            reason: "stale_run",
+            activeTriggerRunId: runId ?? null,
+          },
+          { status: 409 },
+        );
+      }
+      ownedChat = {
+        chatId: chat.id,
+        runId: runId ?? undefined,
+        approvalSessionId: approvalSessionId ?? undefined,
+      };
+      stage = "close_approval_session";
+      await closeAgentApprovalSession(approvalSessionId, "agent-run-canceled");
+      if (!runId) {
+        if (approvalSessionId) {
+          stage = "clear_active_run";
+          await setActiveTriggerRun({
+            chatId,
+            triggerRunId: null,
+            approvalSessionId: null,
+            expectedApprovalSessionId: approvalSessionId,
+            clearApprovalPending: true,
+          });
+        }
+        // No active run — treat as already-stopped (idempotent).
+        return NextResponse.json({ canceled: false, reason: "no_active_run" });
+      }
+
+      stage = "cancel_trigger_run";
+      await cancelAgentTriggerRun(runId);
+      stage = "clear_active_run";
+      await setActiveTriggerRun({
+        chatId,
+        triggerRunId: null,
+        approvalSessionId: null,
+        expectedRunId: runId,
+        ...(approvalSessionId
+          ? { expectedApprovalSessionId: approvalSessionId }
+          : {}),
+        clearApprovalPending: true,
+      });
+
+      return NextResponse.json({ canceled: true, runId });
+    } catch (error) {
+      return handleAgentRouteError({
+        error,
+        endpoint,
+        action: "cancel",
+        fallbackMessage: "Failed to cancel run",
+        context: {
+          requestId,
+          userId,
+          chatId: ownedChat?.chatId,
+          runId: ownedChat?.runId,
+          approvalSessionId: ownedChat?.approvalSessionId,
+          stage,
+        },
+      });
+    } finally {
+      slowRequestTimers.forEach(clearTimeout);
+    }
+  };

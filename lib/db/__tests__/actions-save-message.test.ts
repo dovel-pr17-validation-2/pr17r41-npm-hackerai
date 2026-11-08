@@ -1,0 +1,3117 @@
+import { describe, expect, it, jest } from "@jest/globals";
+import type { UIMessage } from "ai";
+
+const loadSaveMessageWithMocks = async () => {
+  jest.resetModules();
+  process.env.NEXT_PUBLIC_CONVEX_URL = "https://example.convex.cloud";
+
+  const mockMutation = jest.fn().mockResolvedValue({ id: "message-1" });
+  const mockQuery = jest.fn();
+  const mockPhEvent = jest.fn();
+  const mockModerate = jest.fn().mockResolvedValue({
+    shouldUncensorResponse: false,
+    allowsFreeAbliteration: false,
+    moderationText: "",
+  });
+  const mockCompactMessageForStorage = jest.fn((message: any) => {
+    const sizeBytes = JSON.stringify(message.parts).length;
+    return {
+      message,
+      compacted: false,
+      beforeSizeBytes: sizeBytes,
+      afterSizeBytes: sizeBytes,
+      strippedUiOnlyFields: false,
+      prunedCount: 0,
+    };
+  });
+
+  jest.doMock("server-only", () => ({}), { virtual: true });
+  jest.doMock("@/lib/moderation", () => ({
+    getModerationResult: mockModerate,
+  }));
+  jest.doMock("convex/browser", () => ({
+    ConvexHttpClient: class {
+      mutation = mockMutation;
+      query = mockQuery;
+      action = jest.fn();
+    },
+  }));
+  jest.doMock("@/lib/posthog/server", () => ({
+    phLogger: {
+      event: mockPhEvent,
+      error: jest.fn(),
+      warn: jest.fn(),
+      info: jest.fn(),
+      flush: jest.fn(),
+    },
+  }));
+  jest.doMock("@/lib/chat/compaction/prune-tool-outputs", () => ({
+    compactMessageForStorage: mockCompactMessageForStorage,
+  }));
+
+  const {
+    deleteAllChatsForBackend,
+    deleteChatForBackend,
+    fenceAndGetActiveAgentResourcesForUser,
+    getChatById,
+    getMessagesByChatId,
+    getNotes,
+    handleInitialChatAndUserMessage,
+    saveChat,
+    saveMessage,
+    setActiveTriggerRun,
+    updateChat,
+    updateChatTitle,
+  } = await import("../actions");
+  return {
+    deleteAllChatsForBackend,
+    deleteChatForBackend,
+    fenceAndGetActiveAgentResourcesForUser,
+    getChatById,
+    getMessagesByChatId,
+    getNotes,
+    handleInitialChatAndUserMessage,
+    mockCompactMessageForStorage,
+    mockMutation,
+    mockPhEvent,
+    mockModerate,
+    mockQuery,
+    saveChat,
+    saveMessage,
+    setActiveTriggerRun,
+    updateChat,
+    updateChatTitle,
+  };
+};
+
+describe("fenceAndGetActiveAgentResourcesForUser", () => {
+  it("distinguishes unavailable notes from a successful empty snapshot for strict callers", async () => {
+    const { getNotes, mockQuery } = await loadSaveMessageWithMocks();
+    const opts = { userId: "user", subscription: "pro" as const };
+    mockQuery.mockRejectedValue(new Error("database unavailable"));
+    await expect(getNotes(opts)).resolves.toEqual([]);
+    await expect(getNotes({ ...opts, throwOnError: true })).rejects.toThrow(
+      "database unavailable",
+    );
+    mockQuery.mockResolvedValue([]);
+    await expect(getNotes({ ...opts, throwOnError: true })).resolves.toEqual(
+      [],
+    );
+  });
+  it("collects active resources while advancing through fence cursors", async () => {
+    const { fenceAndGetActiveAgentResourcesForUser, mockMutation, mockQuery } =
+      await loadSaveMessageWithMocks();
+    const calls: string[] = [];
+    mockQuery.mockResolvedValue({
+      runs: [{ chat_id: "chat-1", trigger_run_id: "child-validation-run-1" }],
+      hasMore: false,
+    });
+    mockMutation
+      .mockImplementationOnce(async () => {
+        calls.push("fence-1");
+        return {
+          fencedChats: 100,
+          isDone: false,
+          continueCursor: "cursor-1",
+          resources: [{ chatId: "chat-1", triggerRunId: "run-1" }],
+        };
+      })
+      .mockImplementationOnce(async () => {
+        calls.push("fence-2");
+        return {
+          fencedChats: 1,
+          isDone: true,
+          continueCursor: "",
+          resources: [
+            { chatId: "chat-2", approvalSessionId: "approval-session-2" },
+          ],
+        };
+      });
+
+    await expect(
+      fenceAndGetActiveAgentResourcesForUser({ userId: "user-1" }),
+    ).resolves.toEqual({
+      resources: [
+        { chatId: "chat-1", triggerRunId: "run-1" },
+        { chatId: "chat-2", approvalSessionId: "approval-session-2" },
+        { chatId: "chat-1", triggerRunId: "child-validation-run-1" },
+      ],
+      hasMore: false,
+    });
+    expect(calls).toEqual(["fence-1", "fence-2"]);
+    expect(mockMutation).toHaveBeenNthCalledWith(
+      1,
+      expect.anything(),
+      expect.objectContaining({ cursor: null }),
+    );
+    expect(mockMutation).toHaveBeenNthCalledWith(
+      2,
+      expect.anything(),
+      expect.objectContaining({ cursor: "cursor-1" }),
+    );
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(mockQuery.mock.calls[0]?.[1]).toEqual({
+      serviceKey: undefined,
+      userId: "user-1",
+      limit: 100,
+    });
+  });
+});
+
+describe("saveChat", () => {
+  it("retries generic Convex server errors before saving a new chat", async () => {
+    const { saveChat, mockMutation } = await loadSaveMessageWithMocks();
+    const convexError = new Error("[Request ID: abc] Server Error");
+    mockMutation
+      .mockRejectedValueOnce(convexError as never)
+      .mockRejectedValueOnce(convexError as never)
+      .mockResolvedValueOnce("chat-doc-1" as never);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      await expect(
+        saveChat({
+          id: "chat-1",
+          userId: "user-1",
+          title: "hello",
+        }),
+      ).resolves.toBe("chat-doc-1");
+
+      expect(mockMutation).toHaveBeenCalledTimes(3);
+      const retryEvents = warnSpy.mock.calls
+        .map(([line]) => JSON.parse(String(line)))
+        .filter((payload) => payload.event === "chat_save_retry_scheduled");
+
+      expect(retryEvents).toHaveLength(2);
+      expect(retryEvents[0]).toMatchObject({
+        retry_reason: "convex_server_error",
+        attempt: 1,
+        next_attempt: 2,
+        retry_delay_ms: 0,
+        chat_id: "chat-1",
+        user_id: "user-1",
+        title_length: 5,
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("classifies exhausted generic Convex server errors as transient database failures", async () => {
+    const { saveChat, mockMutation, mockPhEvent } =
+      await loadSaveMessageWithMocks();
+    const convexError = new Error("[Request ID: abc] Server Error");
+    mockMutation.mockRejectedValue(convexError as never);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const thrown = await saveChat({
+        id: "chat-1",
+        userId: "user-1",
+        title: "hello",
+      }).catch((error) => error);
+
+      expect(thrown).toMatchObject({
+        type: "offline",
+        surface: "database",
+        statusCode: 503,
+        metadata: expect.objectContaining({
+          db_operation: "chats.saveChat",
+          db_error_name: "Error",
+          db_error_message: "[Request ID: abc] Server Error",
+          db_request_id: "abc",
+          db_retry_reason: "convex_server_error",
+          chat_id: "chat-1",
+          user_id: "user-1",
+          title_length: 5,
+        }),
+      });
+      expect(mockMutation).toHaveBeenCalledTimes(3);
+      expect(mockPhEvent).toHaveBeenCalledWith(
+        "database_operation_failed",
+        expect.objectContaining({
+          db_operation: "chats.saveChat",
+          db_retry_reason: "convex_server_error",
+          chat_id: "chat-1",
+          user_id: "user-1",
+          userId: "user-1",
+        }),
+      );
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("emits queryable PostHog metadata when chat creation still fails", async () => {
+    const { saveChat, mockMutation, mockPhEvent } =
+      await loadSaveMessageWithMocks();
+    const convexError = new Error("[Request ID: abc] Server Error") as Error & {
+      data?: unknown;
+    };
+    convexError.name = "ConvexError";
+    convexError.data = {
+      code: "CHAT_SAVE_FAILED",
+      message: "Failed to save chat",
+      failureStage: "insert_chat",
+      causeName: "WorkerOverloaded",
+      causeMessage: "Worker overloaded",
+    };
+    mockMutation.mockRejectedValue(convexError as never);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const thrown = await saveChat({
+        id: "chat-1",
+        userId: "user-1",
+        title: "x".repeat(100),
+      }).catch((error) => error);
+
+      expect(thrown).toMatchObject({
+        type: "offline",
+        surface: "database",
+        statusCode: 503,
+        metadata: expect.objectContaining({
+          db_operation: "chats.saveChat",
+          db_error_name: "ConvexError",
+          db_error_message: "[Request ID: abc] Server Error",
+          db_request_id: "abc",
+          db_error_code: "CHAT_SAVE_FAILED",
+          db_failure_stage: "insert_chat",
+          db_retry_reason: "worker_overloaded",
+          chat_id: "chat-1",
+          user_id: "user-1",
+          title_length: 100,
+        }),
+      });
+
+      expect(mockPhEvent).toHaveBeenCalledWith(
+        "database_operation_failed",
+        expect.objectContaining({
+          db_operation: "chats.saveChat",
+          db_request_id: "abc",
+          db_error_code: "CHAT_SAVE_FAILED",
+          db_failure_stage: "insert_chat",
+          db_retry_reason: "worker_overloaded",
+          chat_id: "chat-1",
+          user_id: "user-1",
+          userId: "user-1",
+          title_length: 100,
+        }),
+      );
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+});
+
+describe("getChatById", () => {
+  const cloudflareBadGatewayPage = `<!DOCTYPE html>
+    <html><head><title>502 Bad Gateway</title></head>
+    <body>cloudflare PRIVATE_UPSTREAM_BODY</body></html>`;
+
+  it("recovers a standard Cloudflare 502 lookup within the existing retry budget", async () => {
+    const { getChatById, mockQuery } = await loadSaveMessageWithMocks();
+    mockQuery
+      .mockRejectedValueOnce(new Error(cloudflareBadGatewayPage) as never)
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" } as never);
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await expect(getChatById({ id: "chat-1" })).resolves.toEqual({
+        id: "chat-1",
+        user_id: "user-1",
+      });
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(String(warnSpy.mock.calls[0][0]))).toMatchObject({
+        event: "chat_fetch_retry_scheduled",
+        retry_reason: "convex_upstream_http_5xx",
+        attempt: 1,
+        next_attempt: 2,
+      });
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    "<html><title>502 Bad Gateway</title><body>unrelated host</body></html>",
+    "<html><title>403 Forbidden</title><body>cloudflare</body></html>",
+    "Cloudflare 502 Bad Gateway",
+  ])("does not add retries for an unrelated error page: %s", async (page) => {
+    const { getChatById, mockQuery } = await loadSaveMessageWithMocks();
+    mockQuery.mockRejectedValue(new Error(page) as never);
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(getChatById({ id: "chat-1" })).rejects.toMatchObject({
+        type: "bad_request",
+        metadata: expect.not.objectContaining({
+          db_error_kind: "convex_upstream_http_error",
+        }),
+      });
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("retries transient Convex fetch failures before returning a chat", async () => {
+    const { getChatById, mockQuery } = await loadSaveMessageWithMocks();
+    const fetchError = new TypeError("fetch failed");
+    mockQuery
+      .mockRejectedValueOnce(fetchError as never)
+      .mockRejectedValueOnce(fetchError as never)
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" } as never);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      await expect(getChatById({ id: "chat-1" })).resolves.toEqual({
+        id: "chat-1",
+        user_id: "user-1",
+      });
+
+      expect(mockQuery).toHaveBeenCalledTimes(3);
+      const retryEvents = warnSpy.mock.calls
+        .map(([line]) => JSON.parse(String(line)))
+        .filter((payload) => payload.event === "chat_fetch_retry_scheduled");
+
+      expect(retryEvents).toHaveLength(2);
+      expect(retryEvents[0]).toMatchObject({
+        retry_reason: "network_fetch_failed",
+        attempt: 1,
+        next_attempt: 2,
+        retry_delay_ms: 0,
+        chat_id: "chat-1",
+      });
+      expect(retryEvents[1]).toMatchObject({
+        retry_reason: "network_fetch_failed",
+        attempt: 2,
+        next_attempt: 3,
+        retry_delay_ms: 0,
+        chat_id: "chat-1",
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("retries Convex queue saturation failures before returning a chat", async () => {
+    const { getChatById, mockQuery } = await loadSaveMessageWithMocks();
+    const queueError = new Error(
+      "ExpiredInQueue: Too many concurrent requests",
+    );
+    mockQuery
+      .mockRejectedValueOnce(queueError as never)
+      .mockRejectedValueOnce(queueError as never)
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" } as never);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      await expect(getChatById({ id: "chat-1" })).resolves.toEqual({
+        id: "chat-1",
+        user_id: "user-1",
+      });
+
+      expect(mockQuery).toHaveBeenCalledTimes(3);
+      const retryEvents = warnSpy.mock.calls
+        .map(([line]) => JSON.parse(String(line)))
+        .filter((payload) => payload.event === "chat_fetch_retry_scheduled");
+
+      expect(retryEvents).toHaveLength(2);
+      expect(retryEvents[0]).toMatchObject({
+        retry_reason: "convex_queue_saturated",
+        attempt: 1,
+        next_attempt: 2,
+        retry_delay_ms: 0,
+        chat_id: "chat-1",
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("classifies exhausted transient fetch failures as database availability errors", async () => {
+    const { getChatById, mockPhEvent, mockQuery } =
+      await loadSaveMessageWithMocks();
+    mockQuery.mockRejectedValue(new TypeError("fetch failed") as never);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const thrown = await getChatById({ id: "chat-1" }).catch(
+        (error) => error,
+      );
+
+      expect(thrown).toMatchObject({
+        type: "offline",
+        surface: "database",
+        statusCode: 503,
+        metadata: expect.objectContaining({
+          db_operation: "chats.getChatById",
+          db_error_name: "TypeError",
+          db_error_message: "fetch failed",
+          db_retry_reason: "network_fetch_failed",
+          chat_id: "chat-1",
+        }),
+      });
+      expect(mockQuery).toHaveBeenCalledTimes(3);
+      expect(mockPhEvent).toHaveBeenCalledWith(
+        "database_operation_failed",
+        expect.objectContaining({
+          db_operation: "chats.getChatById",
+          db_error_name: "TypeError",
+          db_error_message: "fetch failed",
+          db_retry_reason: "network_fetch_failed",
+          chat_id: "chat-1",
+        }),
+      );
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    {
+      status: 520,
+      page: `<!DOCTYPE html>
+        <html><head><title>haiusercontent.com | 520: Web server is returning an unknown error</title></head>
+        <body>Error code 520 Cloudflare Ray ID: <strong>a18f8f8c09cee629</strong> Your IP: 192.0.2.1</body></html>`,
+      rayId: "a18f8f8c09cee629",
+    },
+    { status: 502, page: cloudflareBadGatewayPage, rayId: undefined },
+  ])(
+    "classifies and sanitizes exhausted Cloudflare $status lookups",
+    async ({ status, page, rayId }) => {
+      const { getChatById, mockPhEvent, mockQuery } =
+        await loadSaveMessageWithMocks();
+      const cloudflareError = new Error(page);
+      mockQuery.mockRejectedValue(cloudflareError as never);
+
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const errorSpy = jest
+        .spyOn(console, "error")
+        .mockImplementation(() => {});
+
+      try {
+        const thrown = await getChatById({ id: "chat-1" }).catch(
+          (error) => error,
+        );
+
+        expect(thrown).toMatchObject({
+          type: "offline",
+          surface: "database",
+          statusCode: 503,
+          metadata: expect.objectContaining({
+            db_operation: "chats.getChatById",
+            db_error_message: `Convex upstream returned HTTP ${status}`,
+            db_error_kind: "convex_upstream_http_error",
+            db_upstream_status_code: status,
+            db_upstream_ray_id: rayId,
+            db_retry_reason: "convex_upstream_http_5xx",
+          }),
+        });
+        expect(mockQuery).toHaveBeenCalledTimes(3);
+        expect(JSON.stringify(thrown.metadata)).not.toContain("192.0.2.1");
+        expect(thrown.message).not.toContain("192.0.2.1");
+        expect(thrown.cause).toBe(
+          `Database temporarily unavailable: chats.getChatById: Convex upstream returned HTTP ${status}`,
+        );
+        expect(JSON.stringify(errorSpy.mock.calls)).not.toContain("192.0.2.1");
+        expect(mockPhEvent).toHaveBeenCalledWith(
+          "database_operation_failed",
+          expect.objectContaining({
+            db_error_message: `Convex upstream returned HTTP ${status}`,
+            db_upstream_status_code: status,
+            db_upstream_ray_id: rayId,
+          }),
+        );
+        expect(errorSpy).toHaveBeenCalledTimes(1);
+        const terminalDiagnostics = JSON.stringify({
+          metadata: thrown.metadata,
+          logs: errorSpy.mock.calls,
+          events: mockPhEvent.mock.calls,
+        });
+        expect(terminalDiagnostics).not.toContain("PRIVATE_UPSTREAM_BODY");
+      } finally {
+        warnSpy.mockRestore();
+        errorSpy.mockRestore();
+      }
+    },
+  );
+});
+
+describe("updateChat", () => {
+  it("retries transient fetch failures before updating final chat metadata", async () => {
+    const { mockMutation, updateChat } = await loadSaveMessageWithMocks();
+    const fetchError = new TypeError("fetch failed");
+    mockMutation
+      .mockRejectedValueOnce(fetchError as never)
+      .mockRejectedValueOnce(fetchError as never)
+      .mockResolvedValueOnce("chat-doc-1" as never);
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      await expect(
+        updateChat({ chatId: "chat-1", finishReason: "stop" }),
+      ).resolves.toBe("chat-doc-1");
+
+      expect(mockMutation).toHaveBeenCalledTimes(3);
+      const retryEvents = warnSpy.mock.calls
+        .map(([line]) => JSON.parse(String(line)))
+        .filter((payload) => payload.event === "chat_update_retry_scheduled");
+      expect(retryEvents).toHaveLength(2);
+      expect(retryEvents[0]).toMatchObject({
+        db_operation: "chats.updateChat",
+        retry_reason: "network_fetch_failed",
+        attempt: 1,
+        next_attempt: 2,
+        retry_delay_ms: 0,
+        chat_id: "chat-1",
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("does not retry non-transient update failures", async () => {
+    const { mockMutation, updateChat } = await loadSaveMessageWithMocks();
+    mockMutation.mockRejectedValue(new Error("Invalid todos") as never);
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await expect(updateChat({ chatId: "chat-1" })).rejects.toMatchObject({
+        type: "bad_request",
+        surface: "database",
+        metadata: expect.objectContaining({
+          db_operation: "chats.updateChat",
+          chat_id: "chat-1",
+        }),
+      });
+      expect(mockMutation).toHaveBeenCalledTimes(1);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+});
+
+describe("updateChatTitle", () => {
+  it("sends only title fields through the title-specific mutation", async () => {
+    const { mockMutation, updateChatTitle } = await loadSaveMessageWithMocks();
+
+    await expect(
+      updateChatTitle({ chatId: "chat-1", title: "Generated Title" }),
+    ).resolves.toEqual({ id: "message-1" });
+
+    expect(mockMutation).toHaveBeenCalledTimes(1);
+    const mutationArgs = mockMutation.mock.calls[0]?.[1] as Record<
+      string,
+      unknown
+    >;
+    expect(mutationArgs).toMatchObject({
+      chatId: "chat-1",
+      title: "Generated Title",
+    });
+    expect(Object.keys(mutationArgs).sort()).toEqual([
+      "chatId",
+      "serviceKey",
+      "title",
+    ]);
+  });
+});
+
+describe("setActiveTriggerRun", () => {
+  it("returns the explicit Convex association result", async () => {
+    const { mockMutation, setActiveTriggerRun } =
+      await loadSaveMessageWithMocks();
+    mockMutation.mockResolvedValue("deleting" as never);
+
+    await expect(
+      setActiveTriggerRun({
+        chatId: "chat-1",
+        triggerRunId: "run-1",
+      }),
+    ).resolves.toBe("deleting");
+  });
+
+  it("preserves transient database failures with queryable run metadata", async () => {
+    const { mockMutation, setActiveTriggerRun } =
+      await loadSaveMessageWithMocks();
+    mockMutation.mockRejectedValue(new TypeError("fetch failed") as never);
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await expect(
+        setActiveTriggerRun({
+          chatId: "chat-1",
+          triggerRunId: "run-1",
+          expectedRunId: "run-0",
+        }),
+      ).rejects.toMatchObject({
+        type: "offline",
+        surface: "database",
+        statusCode: 503,
+        metadata: expect.objectContaining({
+          db_operation: "chats.setActiveTriggerRun",
+          db_retry_reason: "network_fetch_failed",
+          chat_id: "chat-1",
+          trigger_run_id: "run-1",
+          expected_run_id: "run-0",
+        }),
+      });
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+});
+
+describe("saveMessage", () => {
+  it.each([
+    "file_missing",
+    "file_lookup_failed",
+    "file_not_owned",
+    "private-file-name",
+  ])("logs only an allowlisted file validation reason: %s", async (reason) => {
+    const { saveMessage, mockMutation, mockPhEvent } =
+      await loadSaveMessageWithMocks();
+    const failure = Object.assign(
+      new Error("[Request ID: file-check] Server Error"),
+      {
+        data: {
+          code: "MESSAGE_SAVE_FAILED",
+          failureStage: "validate_new_message_file_ownership",
+          fileValidationReason: reason,
+        },
+      },
+    );
+    mockMutation.mockRejectedValue(failure as never);
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const error = await saveMessage({
+        chatId: "chat-1",
+        userId: "user-1",
+        message: {
+          id: "message-1",
+          role: "user",
+          parts: [{ type: "text", text: "attachment" }],
+        },
+      }).catch((e: unknown) => e);
+      expect(mockMutation).toHaveBeenCalledTimes(1);
+      const diagnostics = mockPhEvent.mock.calls.find(
+        (call) => call[0] === "database_operation_failed",
+      )?.[1];
+      expect(diagnostics).toBeDefined();
+      expect(diagnostics?.db_file_validation_reason).toBe(
+        reason === "private-file-name" ? undefined : reason,
+      );
+      expect(diagnostics?.db_failure_stage).toBe(
+        "validate_new_message_file_ownership",
+      );
+      expect(error).toMatchObject({ type: "bad_request", surface: "database" });
+      const { serializeChatSDKErrorForStream } = await import("@/lib/errors");
+      const wireError = serializeChatSDKErrorForStream(
+        error as import("@/lib/errors").ChatSDKError,
+      );
+      expect(wireError).toContain(
+        "Something went wrong. Please try again later.",
+      );
+      expect(wireError).not.toContain(reason);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("forwards the durable Trigger run ID to Convex", async () => {
+    const { saveMessage, mockMutation } = await loadSaveMessageWithMocks();
+
+    await saveMessage({
+      chatId: "chat-1",
+      userId: "user-1",
+      message: {
+        id: "message-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "partial output" }],
+      },
+      finishReason: "trigger_crashed_client_saved",
+      triggerRunId: "run-1",
+    });
+
+    expect(mockMutation).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        finishReason: "trigger_crashed_client_saved",
+        triggerRunId: "run-1",
+      }),
+    );
+  });
+
+  it("sanitizes assistant parts before storage compaction", async () => {
+    const { saveMessage, mockCompactMessageForStorage } =
+      await loadSaveMessageWithMocks();
+    const circularOutput: Record<string, unknown> = { ok: true };
+    circularOutput.self = circularOutput;
+
+    await expect(
+      saveMessage({
+        chatId: "chat-1",
+        userId: "user-1",
+        message: {
+          id: "message-1",
+          role: "assistant",
+          parts: [
+            {
+              type: "tool-run_terminal_cmd",
+              state: "output-available",
+              input: { command: "echo hi" },
+              output: circularOutput,
+            } as any,
+          ],
+        },
+      }),
+    ).resolves.toBeDefined();
+
+    const compactedMessage = mockCompactMessageForStorage.mock
+      .calls[0]?.[0] as {
+      parts: Array<{ output?: unknown }>;
+    };
+
+    expect(compactedMessage.parts[0].output).toEqual({
+      ok: true,
+      self: "[Circular]",
+    });
+    expect(() => JSON.stringify(compactedMessage.parts)).not.toThrow();
+  });
+
+  it("retains preview references even when storage compaction prunes the tool output", async () => {
+    const { saveMessage, mockMutation, mockCompactMessageForStorage } =
+      await loadSaveMessageWithMocks();
+    mockCompactMessageForStorage.mockImplementation((message: any) => ({
+      message: {
+        ...message,
+        parts: [{ ...message.parts[0], output: "[File: view preview.jpg]" }],
+      },
+      compacted: true,
+      beforeSizeBytes: 900_000,
+      afterSizeBytes: 100,
+      strippedUiOnlyFields: true,
+      prunedCount: 1,
+    }));
+    await saveMessage({
+      chatId: "chat-1",
+      userId: "user-1",
+      message: {
+        id: "message-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-file",
+            toolCallId: "tool-1",
+            state: "output-available",
+            input: { action: "view", path: "preview.jpg" },
+            output: { previewFiles: [{ fileId: "preview-1" }] },
+          },
+        ],
+      } as any,
+    });
+    expect(mockMutation.mock.calls[0]?.[1]).toMatchObject({
+      previewFileIds: ["preview-1"],
+      parts: [expect.objectContaining({ output: "[File: view preview.jpg]" })],
+    });
+  });
+
+  it("removes OpenRouter reasoning metadata before storage compaction", async () => {
+    const { saveMessage, mockCompactMessageForStorage } =
+      await loadSaveMessageWithMocks();
+
+    await expect(
+      saveMessage({
+        chatId: "chat-1",
+        userId: "user-1",
+        message: {
+          id: "message-1",
+          role: "assistant",
+          parts: [
+            {
+              type: "reasoning",
+              state: "done",
+              text: "private chain of thought",
+              providerMetadata: {
+                openrouter: {
+                  reasoning_details: [
+                    {
+                      type: "reasoning.text",
+                      text: "private chain of thought",
+                    },
+                  ],
+                },
+              },
+            },
+            {
+              type: "tool-run_terminal_cmd",
+              state: "output-available",
+              toolCallId: "call-1",
+              input: { command: "echo hi" },
+              output: { result: { exitCode: 0, output: "hi" } },
+              callProviderMetadata: {
+                openrouter: {
+                  reasoning_details: [
+                    { type: "reasoning.text", text: "private tool thought" },
+                  ],
+                },
+              },
+              providerMetadata: {
+                google: { thought_signature: "gemini-signature" },
+              },
+            },
+          ],
+        },
+      }),
+    ).resolves.toBeDefined();
+
+    const compactedMessage = mockCompactMessageForStorage.mock
+      .calls[0]?.[0] as {
+      parts: Array<Record<string, unknown>>;
+    };
+
+    expect(compactedMessage.parts).toHaveLength(2);
+    expect(compactedMessage.parts[0]).toMatchObject({
+      type: "reasoning",
+      state: "done",
+      text: "private chain of thought",
+    });
+    expect(compactedMessage.parts[0].providerMetadata).toBeUndefined();
+    expect(compactedMessage.parts[1].type).toBe("tool-run_terminal_cmd");
+    expect(compactedMessage.parts[1].providerMetadata).toEqual({
+      google: { thought_signature: "gemini-signature" },
+    });
+    expect(compactedMessage.parts[1].callProviderMetadata).toBeUndefined();
+    expect(JSON.stringify(compactedMessage.parts)).not.toContain(
+      "reasoning_details",
+    );
+  });
+
+  it("sanitizes usage metadata before saving", async () => {
+    const { saveMessage, mockMutation } = await loadSaveMessageWithMocks();
+    const invalidUsageKey = "$provider\nraw";
+
+    await expect(
+      saveMessage({
+        chatId: "chat-1",
+        userId: "user-1",
+        message: {
+          id: "message-1",
+          role: "assistant",
+          parts: [{ type: "text", text: "done" }],
+        },
+        usage: {
+          inputTokens: 12,
+          [invalidUsageKey]: { ok: true },
+        },
+      }),
+    ).resolves.toBeDefined();
+
+    const mutationArgs = mockMutation.mock.calls[0]?.[1] as {
+      usage?: Record<string, unknown>;
+    };
+    expect(mutationArgs.usage?.inputTokens).toBe(12);
+    expect(mutationArgs.usage?.[invalidUsageKey]).toBeUndefined();
+
+    const renamedFields = mutationArgs.usage?._convex_renamed_fields as Array<{
+      storedKey: string;
+      originalKey: string;
+    }>;
+    const renamedUsageField = renamedFields.find(
+      (field) => field.originalKey === invalidUsageKey,
+    );
+    expect(renamedUsageField?.storedKey).toMatch(/^field_provider_raw_/);
+    expect(mutationArgs.usage?.[renamedUsageField!.storedKey]).toEqual({
+      ok: true,
+    });
+  });
+
+  it("retries transient Convex WorkerOverloaded save failures before surfacing an error", async () => {
+    const { saveMessage, mockMutation } = await loadSaveMessageWithMocks();
+    const convexError = new Error("[Request ID: abc] Server Error") as Error & {
+      data?: unknown;
+    };
+    convexError.name = "ConvexError";
+    convexError.data = {
+      code: "MESSAGE_SAVE_FAILED",
+      message: "Failed to save message",
+      failureStage: "insert_message",
+      causeName: "WorkerOverloaded",
+      causeMessage: "Worker overloaded",
+    };
+    mockMutation
+      .mockRejectedValueOnce(convexError as never)
+      .mockRejectedValueOnce(convexError as never)
+      .mockResolvedValueOnce({ id: "message-1" } as never);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      await expect(
+        saveMessage({
+          chatId: "chat-1",
+          userId: "user-1",
+          message: {
+            id: "message-1",
+            role: "assistant",
+            parts: [{ type: "text", text: "done" }],
+          },
+        }),
+      ).resolves.toEqual({ id: "message-1" });
+
+      expect(mockMutation).toHaveBeenCalledTimes(3);
+      const retryEvents = warnSpy.mock.calls
+        .map(([line]) => JSON.parse(String(line)))
+        .filter((payload) => payload.event === "message_save_retry_scheduled");
+      expect(retryEvents).toHaveLength(2);
+      expect(retryEvents[0]).toMatchObject({
+        retry_reason: "worker_overloaded",
+        attempt: 1,
+        next_attempt: 2,
+        retry_delay_ms: 0,
+        chat_id: "chat-1",
+        message_id: "message-1",
+      });
+      expect(retryEvents[1]).toMatchObject({
+        retry_reason: "worker_overloaded",
+        attempt: 2,
+        next_attempt: 3,
+        retry_delay_ms: 0,
+        chat_id: "chat-1",
+        message_id: "message-1",
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("retries and classifies exhausted Convex write-rate limits as unavailable", async () => {
+    const { saveMessage, mockMutation, mockPhEvent } =
+      await loadSaveMessageWithMocks();
+    const writeRateError = new Error(
+      "[Request ID: abc] Server Error",
+    ) as Error & {
+      data?: unknown;
+    };
+    writeRateError.name = "ConvexError";
+    writeRateError.data = {
+      code: "MESSAGE_SAVE_FAILED",
+      message: "Failed to save message",
+      failureStage: "insert_message",
+      causeName: "TooManyWrites",
+      causeMessage:
+        "Too many writes per second. Your deployment is limited to 8 MiB bytes written per 1 second.",
+    };
+    mockMutation.mockRejectedValue(writeRateError as never);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const thrown = await saveMessage({
+        chatId: "chat-1",
+        userId: "user-1",
+        message: {
+          id: "message-1",
+          role: "user",
+          parts: [{ type: "text", text: "hello" }],
+        },
+      }).catch((error) => error);
+
+      expect(thrown).toMatchObject({
+        type: "offline",
+        surface: "database",
+        statusCode: 503,
+        metadata: expect.objectContaining({
+          db_operation: "messages.saveMessage",
+          db_retry_reason: "convex_write_rate_limited",
+        }),
+      });
+      expect(mockMutation).toHaveBeenCalledTimes(3);
+
+      const retryEvents = warnSpy.mock.calls
+        .map(([line]) => JSON.parse(String(line)))
+        .filter((payload) => payload.event === "message_save_retry_scheduled");
+      expect(retryEvents).toHaveLength(2);
+      expect(retryEvents[0]).toMatchObject({
+        retry_reason: "convex_write_rate_limited",
+        attempt: 1,
+        next_attempt: 2,
+        retry_delay_ms: 0,
+        chat_id: "chat-1",
+        message_id: "message-1",
+      });
+      expect(mockPhEvent).toHaveBeenCalledWith(
+        "database_operation_failed",
+        expect.objectContaining({
+          db_operation: "messages.saveMessage",
+          db_retry_reason: "convex_write_rate_limited",
+        }),
+      );
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("maps Convex message-size rejections to a user-facing bad request", async () => {
+    const { saveMessage, mockMutation } = await loadSaveMessageWithMocks();
+    const convexError = new Error("[Request ID: abc] Server Error") as Error & {
+      data?: unknown;
+    };
+    convexError.name = "ConvexError";
+    convexError.data = {
+      code: "MESSAGE_TOO_LARGE",
+      message: "Message is too large to save",
+      failureStage: "prepare_insert_message",
+    };
+    mockMutation.mockRejectedValueOnce(convexError as never);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await expect(
+        saveMessage({
+          chatId: "chat-1",
+          userId: "user-1",
+          message: {
+            id: "message-1",
+            role: "user",
+            parts: [{ type: "text", text: "x".repeat(990 * 1024) }],
+          },
+        }),
+      ).rejects.toMatchObject({
+        type: "bad_request",
+        surface: "api",
+        statusCode: 400,
+        cause:
+          "Your message is too large to save. Please shorten it or attach the content as a file instead.",
+        metadata: expect.objectContaining({
+          db_operation: "messages.saveMessage",
+          db_error_code: "MESSAGE_TOO_LARGE",
+        }),
+      });
+
+      const warnEvents = warnSpy.mock.calls.map(([line]) => {
+        const payload = JSON.parse(String(line));
+        return payload.event;
+      });
+      expect(warnEvents).toContain("message_save_rejected_too_large");
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("treats wrapped canceled-chat message saves as warnings", async () => {
+    const { saveMessage, mockMutation } = await loadSaveMessageWithMocks();
+    const convexError = new Error("[Request ID: abc] Server Error") as Error & {
+      data?: unknown;
+    };
+    convexError.name = "ConvexError";
+    convexError.data = {
+      code: "MESSAGE_SAVE_FAILED",
+      message: "Failed to save message",
+      failureStage: "verify_chat_writable_for_insert",
+      causeData: {
+        code: "CHAT_CANCELED",
+        message: "This chat is no longer accepting new messages",
+      },
+    };
+    mockMutation.mockRejectedValueOnce(convexError as never);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await expect(
+        saveMessage({
+          chatId: "chat-1",
+          userId: "user-1",
+          message: {
+            id: "message-1",
+            role: "user",
+            parts: [{ type: "text", text: "next prompt" }],
+          },
+        }),
+      ).rejects.toMatchObject({
+        type: "bad_request",
+        surface: "chat",
+        statusCode: 400,
+        cause:
+          "This chat was stopped before your message could be saved. Please send it again.",
+        metadata: expect.objectContaining({
+          db_operation: "messages.saveMessage",
+          db_error_code: "MESSAGE_SAVE_FAILED",
+          db_cause_error_code: "CHAT_CANCELED",
+          db_failure_stage: "verify_chat_writable_for_insert",
+        }),
+      });
+
+      const warnEvents = warnSpy.mock.calls.map(([line]) => {
+        const payload = JSON.parse(String(line));
+        return payload.event;
+      });
+      expect(warnEvents).toContain("message_save_rejected_chat_canceled");
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("classifies nested message ownership denials without logging Convex error data", async () => {
+    const { saveMessage, mockMutation } = await loadSaveMessageWithMocks();
+    const convexError = new Error("[Request ID: abc] Server Error") as Error & {
+      data?: unknown;
+    };
+    convexError.name = "ConvexError";
+    convexError.data = {
+      code: "MESSAGE_SAVE_FAILED",
+      message: "Failed to save message",
+      failureStage: "verify_existing_message_ownership",
+      causeData: {
+        code: "MESSAGE_UNAUTHORIZED",
+        message: "You don't have permission to update this message",
+      },
+      causeMessage:
+        '{"code":"MESSAGE_UNAUTHORIZED","message":"You don\'t have permission to update this message"}',
+      chatId: "nested-chat-id",
+      messageId: "nested-message-id",
+      operation: "messages.saveMessage",
+    };
+    mockMutation.mockRejectedValueOnce(convexError as never);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const thrown = await saveMessage({
+        chatId: "test1",
+        userId: "user-1",
+        message: {
+          id: "1",
+          role: "user",
+          parts: [{ type: "text", text: "hi" }],
+        },
+      }).catch((error) => error);
+
+      expect(thrown).toMatchObject({
+        type: "forbidden",
+        surface: "chat",
+        statusCode: 403,
+        metadata: expect.objectContaining({
+          db_operation: "messages.saveMessage",
+          db_error_name: "ConvexError",
+          db_error_message: "[Request ID: abc] Server Error",
+          db_error_code: "MESSAGE_SAVE_FAILED",
+          db_cause_error_code: "MESSAGE_UNAUTHORIZED",
+          db_failure_stage: "verify_existing_message_ownership",
+        }),
+      });
+      expect(thrown.metadata).not.toHaveProperty("db_error_data");
+
+      const warnPayloads = warnSpy.mock.calls.map(([line]) =>
+        JSON.parse(String(line)),
+      );
+      const accessDeniedPayload = warnPayloads.find(
+        (payload) => payload.event === "chat_access_denied",
+      );
+      expect(accessDeniedPayload).toMatchObject({
+        level: "warn",
+        db_operation: "messages.saveMessage",
+        db_error_code: "MESSAGE_SAVE_FAILED",
+        db_cause_error_code: "MESSAGE_UNAUTHORIZED",
+        db_failure_stage: "verify_existing_message_ownership",
+        chat_id: "test1",
+        user_id: "user-1",
+        message_id: "1",
+      });
+      expect(accessDeniedPayload).not.toHaveProperty("db_error_data");
+      expect(JSON.stringify(accessDeniedPayload)).not.toContain("causeData");
+      expect(JSON.stringify(accessDeniedPayload)).not.toContain(
+        "You don't have permission to update this message",
+      );
+      expect(JSON.stringify(accessDeniedPayload)).not.toContain(
+        "nested-chat-id",
+      );
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+});
+
+describe("getMessagesByChatId", () => {
+  it.each(["ask", "agent"] as const)(
+    "regenerates %s from the saved user turn when discarded answers exceed the history budget",
+    async (mode) => {
+      const { getMessagesByChatId, mockQuery } =
+        await loadSaveMessageWithMocks();
+      const history = [
+        {
+          id: "old-user",
+          role: "user",
+          parts: [{ type: "text", text: "Earlier question" }],
+        },
+        {
+          id: "old-answer",
+          role: "assistant",
+          parts: [{ type: "text", text: "Earlier answer" }],
+        },
+        {
+          id: "retry-user",
+          role: "user",
+          parts: [{ type: "text", text: "Reply OK" }],
+        },
+      ];
+      const discardedAnswers = [
+        {
+          id: "draft",
+          role: "assistant",
+          parts: [{ type: "text", text: "Discard this draft" }],
+        },
+        {
+          id: "oversized-answer",
+          role: "assistant",
+          parts: [
+            {
+              type: "tool-test",
+              toolCallId: "test-call",
+              state: "output-available",
+              input: {},
+              output: { text: "\u0001".repeat(70_001) },
+            },
+          ],
+        },
+      ];
+      mockQuery
+        .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+        .mockResolvedValueOnce({
+          page: [...history, ...discardedAnswers].reverse(),
+          isDone: true,
+          continueCursor: null,
+        });
+      const result = await getMessagesByChatId({
+        chatId: "chat-1",
+        userId: "user-1",
+        subscription: "free",
+        mode,
+        regenerate: true,
+        newMessages: [
+          {
+            id: "untrusted-client-turn",
+            role: "user",
+            parts: [{ type: "text", text: "Must not replace saved history" }],
+          },
+        ],
+      });
+      expect(result.truncatedMessages).toEqual(history);
+    },
+  );
+
+  it("backfills the user turn when the first regeneration page contains only discarded answers", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const user = {
+      id: "retry-user",
+      role: "user",
+      parts: [{ type: "text", text: "Reply OK" }],
+    };
+    mockQuery
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+      .mockResolvedValueOnce({
+        page: [
+          {
+            id: "oversized-answer",
+            role: "assistant",
+            parts: [
+              {
+                type: "tool-test",
+                toolCallId: "test-call",
+                state: "output-available",
+                input: {},
+                output: { text: "\u0001".repeat(70_001) },
+              },
+            ],
+          },
+        ],
+        isDone: false,
+        continueCursor: "next-page",
+      })
+      .mockResolvedValueOnce({
+        page: [user],
+        isDone: true,
+        continueCursor: null,
+      });
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "free",
+      mode: "agent",
+      regenerate: true,
+      newMessages: [],
+    });
+    expect(result.truncatedMessages).toEqual([user]);
+    expect(mockQuery).toHaveBeenCalledTimes(3);
+    expect(mockQuery.mock.calls[2]?.[1]).toMatchObject({
+      paginationOpts: { numItems: 24, cursor: "next-page" },
+    });
+  });
+
+  it("keeps the history budget for an oversized user turn during regeneration", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    mockQuery
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+      .mockResolvedValueOnce({
+        page: [
+          {
+            id: "answer",
+            role: "assistant",
+            parts: [{ type: "text", text: "Replace me" }],
+          },
+          {
+            id: "oversized-user",
+            role: "user",
+            parts: [{ type: "text", text: "\u0001".repeat(200_000) }],
+          },
+        ],
+        isDone: true,
+        continueCursor: null,
+      });
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "free",
+      mode: "agent",
+      regenerate: true,
+      newMessages: [],
+    });
+    expect(result.truncatedMessages).toEqual([]);
+  });
+
+  it("keeps the four-page cap when regeneration backfills through discarded answers", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    mockQuery.mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" });
+    for (let page = 0; page < 4; page++) {
+      mockQuery.mockResolvedValueOnce({
+        page: [
+          {
+            id: `answer-${page}`,
+            role: "assistant",
+            parts: [{ type: "text", text: "Discard me" }],
+          },
+        ],
+        isDone: false,
+        continueCursor: `page-${page + 1}`,
+      });
+    }
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "free",
+      mode: "agent",
+      regenerate: true,
+      newMessages: [],
+    });
+    expect(result.truncatedMessages).toEqual([]);
+    expect(mockQuery).toHaveBeenCalledTimes(5);
+  });
+
+  const oversizedHistory = (): UIMessage[] => {
+    const parts: UIMessage["parts"] = [];
+    for (let index = 0; index < 56; index++) {
+      parts.push(
+        { type: "step-start" },
+        {
+          type: "tool-run_terminal_cmd",
+          toolCallId: `fixture-call-${index}`,
+          state: "output-available",
+          input: { command: "synthetic read-only fixture" },
+          output: {
+            stdout: "\u0001".repeat(1_200),
+            ...(index === 0 && {
+              result: { session: "term_fixture_123", pid: 12345 },
+            }),
+          },
+        },
+      );
+    }
+    for (let index = 0; index < 24; index++)
+      parts.push({ type: "text", text: `Latest evidence ${index}.` });
+    for (let index = 0; index < 9; index++)
+      parts.push({ type: "data-status", data: { status: "complete" } });
+    return [
+      {
+        id: "source-scope",
+        role: "user",
+        parts: [
+          {
+            type: "text",
+            text: "Inspect example.invalid only. Do not change data.",
+          },
+        ],
+      },
+      {
+        id: "source-correction",
+        role: "user",
+        parts: [
+          {
+            type: "text",
+            text: "Report findings; keep the earlier restrictions.",
+          },
+        ],
+      },
+      { id: "oversized-assistant", role: "assistant", parts },
+    ];
+  };
+
+  it.each(["free", "pro"] as const)(
+    "resumes oversized %s Agent history through processing and SDK conversion without rewriting it",
+    async (subscription) => {
+      const { getMessagesByChatId, mockQuery, mockMutation, mockModerate } =
+        await loadSaveMessageWithMocks();
+      const { countMessagesTokens } = await import("@/lib/token-utils");
+      const { getAgentHistoryBudget } =
+        await import("@/lib/ai/agent-context-budget");
+      const { getProviderToolCallDiagnostics } =
+        await import("@/lib/chat/provider-tool-call-batches");
+      const { processChatMessages } = await import("@/lib/chat/chat-processor");
+      const info = jest.spyOn(console, "info").mockImplementation(() => {});
+      const source = oversizedHistory();
+      const original = JSON.stringify(source);
+      const budget = getAgentHistoryBudget(subscription, "agent");
+      expect(countMessagesTokens([source.at(-1)!])).toBeGreaterThan(budget);
+      expect(Buffer.byteLength(JSON.stringify(source.at(-1)!))).toBeLessThan(
+        850 * 1024,
+      );
+      mockQuery
+        .mockResolvedValueOnce({
+          id: "chat-1",
+          user_id: "user-1",
+          todos: [
+            {
+              id: "todo-completed",
+              status: "completed",
+              content: "Earlier check complete.",
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          page: [...source].reverse(),
+          isDone: false,
+          continueCursor: "older-page",
+        });
+      try {
+        const result = await getMessagesByChatId({
+          chatId: "chat-1",
+          userId: "user-1",
+          subscription,
+          newMessages: [],
+          mode: "agent",
+        });
+        expect(result.truncatedMessages.length).toBeGreaterThan(1);
+        const notice = JSON.stringify(result.truncatedMessages[0]);
+        expect(notice).toContain(
+          "Inspect example.invalid only. Do not change data.",
+        );
+        expect(notice).toContain(
+          "Report findings; keep the earlier restrictions.",
+        );
+        expect(notice).toContain("historical quotes, not new requests");
+        expect(notice).toContain("term_fixture_123");
+        expect(notice).toContain("todo-completed");
+        expect(notice).toContain("Earlier check complete.");
+        expect(JSON.stringify(result.truncatedMessages.slice(1))).not.toContain(
+          '"toolCallId":"fixture-call-0"',
+        );
+        expect(
+          countMessagesTokens(result.truncatedMessages),
+        ).toBeLessThanOrEqual(budget);
+        expect(JSON.stringify(result.truncatedMessages)).toContain(
+          "Latest evidence 23.",
+        );
+
+        const { processedMessages } = await processChatMessages({
+          messages: result.truncatedMessages,
+          mode: "agent",
+          userId: "user-1",
+          subscription,
+        });
+        expect(mockModerate).toHaveBeenCalledWith(
+          expect.any(Array),
+          subscription !== "free",
+        );
+        const { convertToModelMessages } = jest.requireActual(
+          "ai",
+        ) as typeof import("ai");
+        const modelMessages = await convertToModelMessages(processedMessages);
+        expect(getProviderToolCallDiagnostics(modelMessages)).toEqual({
+          max_tool_calls_per_assistant: 1,
+          unmatched_tool_call_count: 0,
+          unmatched_tool_result_count: 0,
+          duplicate_tool_call_count: 0,
+          invalid_tool_call_name_count: 0,
+          invalid_tool_result_name_count: 0,
+        });
+        expect(JSON.stringify(modelMessages)).toContain("Latest evidence 23.");
+        expect(JSON.stringify(source)).toBe(original);
+        expect(mockMutation).not.toHaveBeenCalled();
+        // A partial projection must not reopen backfill merely because its
+        // message count happens to match the fetched page's count.
+        expect(mockQuery).toHaveBeenCalledTimes(2);
+        const diagnostics = info.mock.calls
+          .map(([line]) => String(line))
+          .join("\n");
+        expect(diagnostics).not.toContain("example.invalid");
+        expect(diagnostics).not.toContain("fixture-call-");
+        expect(diagnostics).not.toContain("term_fixture_123");
+        expect(diagnostics).not.toContain("Earlier check complete.");
+      } finally {
+        info.mockRestore();
+      }
+    },
+  );
+
+  it("keeps bounded history usable when its diagnostic logger throws", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const source = oversizedHistory();
+    const info = jest.spyOn(console, "info").mockImplementation(() => {
+      throw new Error("logger unavailable");
+    });
+    mockQuery
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+      .mockResolvedValueOnce({
+        page: [...source].reverse(),
+        isDone: true,
+        continueCursor: null,
+      });
+    try {
+      const result = await getMessagesByChatId({
+        chatId: "chat-1",
+        userId: "user-1",
+        subscription: "free",
+        newMessages: [],
+        mode: "agent",
+      });
+      expect(result.truncatedMessages.length).toBeGreaterThan(1);
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it("includes interrupted-tool repair in the shared projection budget", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const { countMessagesTokens } = await import("@/lib/token-utils");
+    const { getAgentHistoryBudget } =
+      await import("@/lib/ai/agent-context-budget");
+    const source = oversizedHistory();
+    for (let index = 0; index < 160; index++)
+      source.at(-1)!.parts.push(
+        { type: "step-start" },
+        {
+          type: "tool-run_terminal_cmd",
+          toolCallId: `interrupted-${index}`,
+          state: "input-available",
+          input: { command: "fixture" },
+        },
+      );
+    const original = JSON.stringify(source);
+    mockQuery
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+      .mockResolvedValueOnce({
+        page: [...source].reverse(),
+        isDone: true,
+        continueCursor: null,
+      });
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "free",
+      newMessages: [],
+      mode: "agent",
+    });
+    expect(result.truncatedMessages.length).toBeGreaterThan(1);
+    expect(countMessagesTokens(result.truncatedMessages)).toBeLessThanOrEqual(
+      getAgentHistoryBudget("free", "agent"),
+    );
+    expect(JSON.stringify(source)).toBe(original);
+  });
+
+  it("does not reopen backfill after partially projecting a two-record history", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const source = oversizedHistory();
+    mockQuery
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+      .mockResolvedValueOnce({
+        page: [source.at(-1), source[0]],
+        isDone: false,
+        continueCursor: "older-page",
+      })
+      .mockResolvedValueOnce({ page: [], isDone: true, continueCursor: null });
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "free",
+      newMessages: [],
+      mode: "agent",
+    });
+    expect(result.truncatedMessages).toHaveLength(2);
+    expect(mockQuery).toHaveBeenCalledTimes(2);
+  });
+
+  it("backfills source user instructions before recovering an oversized assistant tail", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const source = oversizedHistory();
+    mockQuery
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+      .mockResolvedValueOnce({
+        page: [
+          source.at(-1),
+          {
+            id: "automatic-continue",
+            role: "user",
+            metadata: { isAutoContinue: true },
+            parts: [{ type: "text", text: "Continue automatically." }],
+          },
+        ],
+        isDone: false,
+        continueCursor: "source-page",
+      })
+      .mockResolvedValueOnce({
+        page: source.slice(0, -1).reverse(),
+        isDone: true,
+        continueCursor: null,
+      });
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "free",
+      newMessages: [],
+      mode: "agent",
+    });
+    expect(result.truncatedMessages.length).toBeGreaterThan(1);
+    expect(JSON.stringify(result.truncatedMessages[0])).toContain(
+      "Inspect example.invalid only. Do not change data.",
+    );
+    expect(JSON.stringify(result.truncatedMessages[0])).toContain(
+      "Report findings; keep the earlier restrictions.",
+    );
+    expect(mockQuery.mock.calls[2]?.[1]).toMatchObject({
+      paginationOpts: { numItems: 24, cursor: "source-page" },
+    });
+    expect(mockQuery).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps the four-page cap when oversized history has no source user instructions", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const assistant = oversizedHistory().at(-1)!;
+    mockQuery.mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" });
+    for (let page = 0; page < 4; page++) {
+      mockQuery.mockResolvedValueOnce({
+        page: [{ ...assistant, id: `assistant-page-${page}` }],
+        isDone: false,
+        continueCursor: `older-page-${page + 1}`,
+      });
+    }
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "free",
+      newMessages: [],
+      mode: "agent",
+    });
+    expect(result.truncatedMessages).toEqual([]);
+    expect(mockQuery).toHaveBeenCalledTimes(5);
+  });
+
+  it("does not resume an oversized assistant without source user instructions", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    mockQuery
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+      .mockResolvedValueOnce({
+        page: [oversizedHistory().at(-1)],
+        isDone: true,
+        continueCursor: null,
+      });
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "free",
+      newMessages: [],
+      mode: "agent",
+    });
+    expect(result.truncatedMessages).toEqual([]);
+  });
+
+  it("preserves the stored-summary path for oversized Agent history", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const source = oversizedHistory();
+    mockQuery
+      .mockResolvedValueOnce({
+        id: "chat-1",
+        user_id: "user-1",
+        latest_summary_id: "summary-1",
+      })
+      .mockResolvedValueOnce({
+        summary_text: "Stored summary.",
+        summary_up_to_message_id: "source-scope",
+      })
+      .mockResolvedValueOnce({
+        page: [...source].reverse(),
+        isDone: true,
+        continueCursor: null,
+      });
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "free",
+      newMessages: [],
+      mode: "agent",
+    });
+    expect(result.truncatedMessages).toHaveLength(1);
+    expect(JSON.stringify(result.truncatedMessages)).toContain(
+      "Stored summary.",
+    );
+    expect(JSON.stringify(result.truncatedMessages)).not.toContain(
+      "Only a bounded tail of saved history",
+    );
+    expect(mockQuery).toHaveBeenCalledTimes(3);
+  });
+
+  it("preserves an unseen client user turn instead of replacing it with a history notice", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const source = oversizedHistory();
+    const followup: UIMessage = {
+      id: "new-user",
+      role: "user",
+      parts: [{ type: "text", text: "Stop the earlier work." }],
+    };
+    mockQuery
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+      .mockResolvedValueOnce({
+        page: [...source].reverse(),
+        isDone: true,
+        continueCursor: null,
+      });
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "free",
+      newMessages: [...source, followup],
+      mode: "agent",
+    });
+    expect(result.truncatedMessages).toEqual([followup]);
+  });
+
+  it.each([
+    {
+      name: "empty history",
+      hasClientMessages: false,
+      mode: "agent",
+      regenerate: false,
+      page: [],
+      fileTokens: [],
+      before: 0,
+      reason: "no_candidate_messages",
+    },
+    {
+      name: "over-budget history",
+      hasClientMessages: false,
+      mode: "ask",
+      regenerate: false,
+      page: [
+        {
+          id: "private-message",
+          role: "user",
+          parts: [{ type: "file", fileId: "private-file" }],
+        },
+      ],
+      fileTokens: [{ fileId: "private-file", tokenSize: 1_000_000 }],
+      before: 0,
+      reason: "token_projection_empty",
+    },
+    {
+      name: "assistant-only regeneration",
+      hasClientMessages: false,
+      mode: "agent",
+      regenerate: true,
+      page: [
+        {
+          id: "private-message",
+          role: "assistant",
+          parts: [{ type: "text", text: "private-content" }],
+        },
+      ],
+      fileTokens: [],
+      before: 0,
+      reason: "regenerate_removed_all",
+    },
+    {
+      name: "oversized Agent tool history",
+      hasClientMessages: false,
+      mode: "agent",
+      regenerate: false,
+      page: [
+        {
+          id: "private-assistant",
+          role: "assistant",
+          parts: [
+            { type: "step-start" },
+            { type: "text", text: "private-assistant-canary" },
+            {
+              type: "tool-private-name",
+              toolCallId: "private-call",
+              state: "output-available",
+              input: {},
+              output: { text: "\u0001".repeat(70_001) },
+            },
+            { untyped: "private-shape-canary" },
+          ],
+        },
+        {
+          id: "private-user",
+          role: "user",
+          parts: [{ type: "text", text: "private-user-canary" }],
+        },
+      ],
+      fileTokens: [],
+      before: 0,
+      reason: "token_projection_empty",
+    },
+    {
+      name: "empty regeneration candidate with ignored client messages",
+      hasClientMessages: true,
+      mode: "agent",
+      regenerate: true,
+      page: [],
+      fileTokens: [],
+      before: 0,
+      reason: "no_candidate_messages",
+    },
+  ] as const)(
+    "diagnoses $name without changing its empty return",
+    async ({
+      mode,
+      regenerate,
+      page,
+      fileTokens,
+      before,
+      reason,
+      hasClientMessages,
+    }) => {
+      const { getMessagesByChatId, mockQuery } =
+        await loadSaveMessageWithMocks();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const newMessages = hasClientMessages
+        ? [
+            {
+              id: "client-only",
+              role: "user" as const,
+              parts: [
+                { type: "text" as const, text: "private-client-content" },
+              ],
+            },
+          ]
+        : [];
+      try {
+        mockQuery
+          .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+          .mockResolvedValueOnce({
+            page,
+            fileTokens,
+            isDone: true,
+            continueCursor: null,
+          });
+        const result = await getMessagesByChatId({
+          chatId: "chat-1",
+          userId: "user-1",
+          subscription: "pro",
+          newMessages,
+          regenerate,
+          mode,
+        });
+        expect(result.truncatedMessages).toEqual([]);
+        expect(mockQuery).toHaveBeenCalledTimes(2);
+        const events = warnSpy.mock.calls
+          .map(([line]) => JSON.parse(String(line)))
+          .filter((event) => event.event === "chat_history_projection_empty");
+        expect(events).toEqual([
+          {
+            level: "warn",
+            event: "chat_history_projection_empty",
+            service: "chat-handler",
+            timestamp: expect.any(String),
+            chat_id: "chat-1",
+            user_id: "user-1",
+            mode,
+            regenerate,
+            fetched_messages_count: page.length,
+            new_messages_count: newMessages.length,
+            projected_messages_before_regenerate_count: before,
+            projected_messages_count: 0,
+            pages_fetched: 1,
+            projection_reason: reason,
+            ...(reason === "token_projection_empty"
+              ? {
+                  projection_budget_tokens: 200_000,
+                  projection_blocked_message_tokens:
+                    mode === "agent" ? expect.any(Number) : 1_000_000,
+                  projection_blocked_message_role:
+                    mode === "agent" ? "assistant" : "user",
+                  projection_blocked_message_part_count:
+                    mode === "agent" ? 4 : 1,
+                  projection_blocked_text_part_count: mode === "agent" ? 1 : 0,
+                  projection_blocked_tool_part_count: mode === "agent" ? 1 : 0,
+                  projection_blocked_file_part_count: mode === "agent" ? 0 : 1,
+                  projection_blocked_other_part_count: mode === "agent" ? 2 : 0,
+                }
+              : {}),
+          },
+        ]);
+        const serializedEvents = JSON.stringify(events);
+        expect(serializedEvents).not.toContain("private-");
+        if (reason === "token_projection_empty") {
+          expect(events[0].projection_blocked_message_tokens).toBeGreaterThan(
+            events[0].projection_budget_tokens,
+          );
+        }
+      } finally {
+        warnSpy.mockRestore();
+      }
+    },
+  );
+
+  it("keeps an empty history return when projection diagnostics fail", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {
+      throw new Error("logger unavailable");
+    });
+    try {
+      mockQuery
+        .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+        .mockResolvedValueOnce({
+          page: [],
+          isDone: true,
+          continueCursor: null,
+        });
+      await expect(
+        getMessagesByChatId({
+          chatId: "chat-1",
+          userId: "user-1",
+          subscription: "pro",
+          newMessages: [],
+          mode: "agent",
+        }),
+      ).resolves.toMatchObject({ truncatedMessages: [] });
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it.each([false, true])(
+    "does not log an empty projection when summary=%s returns usable history",
+    async (hasSummary) => {
+      const { getMessagesByChatId, mockQuery } =
+        await loadSaveMessageWithMocks();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const message = {
+        id: "message-1",
+        role: "user" as const,
+        parts: [{ type: "text" as const, text: "private-content" }],
+      };
+      try {
+        mockQuery.mockResolvedValueOnce({
+          id: "chat-1",
+          user_id: "user-1",
+          ...(hasSummary ? { latest_summary_id: "summary-1" } : {}),
+        });
+        if (hasSummary)
+          mockQuery.mockResolvedValueOnce({
+            summary_text: "private-summary",
+            summary_up_to_message_id: "prior-message",
+          });
+        mockQuery.mockResolvedValueOnce({
+          page: hasSummary ? [] : [message],
+          isDone: true,
+          continueCursor: null,
+        });
+        const result = await getMessagesByChatId({
+          chatId: "chat-1",
+          userId: "user-1",
+          subscription: "pro",
+          newMessages: [],
+          mode: "agent",
+        });
+        if (hasSummary)
+          expect(result.truncatedMessages).toEqual([
+            expect.objectContaining({
+              role: "user",
+              parts: [
+                expect.objectContaining({
+                  text: expect.stringContaining("private-summary"),
+                }),
+              ],
+            }),
+          ]);
+        else expect(result.truncatedMessages).toEqual([message]);
+        expect(warnSpy).not.toHaveBeenCalled();
+        expect(mockQuery).toHaveBeenCalledTimes(hasSummary ? 3 : 2);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "uses only backend provenance and disables inheritance on regenerate=%s",
+    async (regenerate) => {
+      const { getMessagesByChatId, mockQuery } =
+        await loadSaveMessageWithMocks();
+      const message = {
+        id: "u",
+        role: "user" as const,
+        parts: [{ type: "text" as const, text: "continue" }],
+      };
+      const evidence = [
+        { id: "a", completed: true, independent: true },
+        { id: "b", completed: true, independent: true },
+      ];
+      mockQuery
+        .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+        .mockResolvedValueOnce({
+          page: [message],
+          abliterationHistory: evidence,
+          isDone: true,
+          continueCursor: null,
+        });
+      const result = await getMessagesByChatId({
+        chatId: "chat-1",
+        userId: "user-1",
+        subscription: "pro",
+        newMessages: [],
+        regenerate,
+        mode: "agent",
+      });
+      expect(result.independentAbliterationResponses).toBe(regenerate ? 0 : 2);
+      expect(result.truncatedMessages).toEqual([message]);
+      expect(JSON.stringify(result.truncatedMessages)).not.toContain(
+        "independent",
+      );
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+    },
+  );
+  it("ignores routing claims in client message metadata", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    mockQuery.mockResolvedValueOnce(null);
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "pro",
+      newMessages: [
+        {
+          id: "a",
+          role: "assistant",
+          parts: [{ type: "text", text: "answer" }],
+          metadata: {
+            abliterationRouting: {
+              version: 1,
+              source: "moderation",
+              completed: true,
+            },
+          },
+        },
+      ],
+      mode: "agent",
+    });
+    expect(result.independentAbliterationResponses).toBe(0);
+  });
+
+  it("logs empty prompts as warnings instead of errors", async () => {
+    const { getMessagesByChatId } = await loadSaveMessageWithMocks();
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await expect(
+        getMessagesByChatId({
+          chatId: "chat-empty",
+          userId: "user-1",
+          subscription: "free",
+          newMessages: [],
+          regenerate: true,
+          mode: "ask",
+        }),
+      ).rejects.toMatchObject({
+        type: "bad_request",
+        surface: "api",
+        statusCode: 400,
+        metadata: expect.objectContaining({
+          empty_prompt: true,
+          all_messages_count: 0,
+          new_messages_count: 0,
+        }),
+      });
+
+      const warnPayloads = warnSpy.mock.calls.map(([line]) =>
+        JSON.parse(String(line)),
+      );
+      expect(warnPayloads).toContainEqual(
+        expect.objectContaining({
+          level: "warn",
+          event: "chat_prompt_empty",
+          chat_id: "chat-empty",
+          user_id: "user-1",
+          all_messages_count: 0,
+          new_messages_count: 0,
+        }),
+      );
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("treats chat history authorization denials as warnings and forbidden chat errors", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const convexError = new Error("[Request ID: abc] Server Error") as Error & {
+      data?: unknown;
+    };
+    convexError.name = "ConvexError";
+    convexError.data = {
+      code: "CHAT_UNAUTHORIZED",
+      message: "You don't have permission to access this chat",
+    };
+
+    mockQuery
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+      .mockRejectedValueOnce(convexError);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await expect(
+        getMessagesByChatId({
+          chatId: "chat-1",
+          userId: "user-1",
+          subscription: "free",
+          newMessages: [],
+          regenerate: true,
+          mode: "ask",
+        }),
+      ).rejects.toMatchObject({
+        type: "forbidden",
+        surface: "chat",
+        statusCode: 403,
+        metadata: expect.objectContaining({
+          db_operation: "messages.getMessagesPageForBackend",
+          db_error_code: "CHAT_UNAUTHORIZED",
+        }),
+      });
+
+      const warnEvents = warnSpy.mock.calls.map(([line]) => {
+        const payload = JSON.parse(String(line));
+        return payload.event;
+      });
+
+      expect(warnEvents).toContain("chat_history_fetch_failed");
+      expect(warnEvents).toContain("chat_access_denied");
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it.each([false, true])(
+    "merges an unpersisted retry without replaying saved client history (local files: %s)",
+    async (localFiles) => {
+      const { getMessagesByChatId, mockQuery } =
+        await loadSaveMessageWithMocks();
+      const oldUser = {
+        id: "old-user",
+        role: "user" as const,
+        parts: [{ type: "text" as const, text: "stored prompt" }],
+      };
+      const oldAssistant = {
+        id: "old-assistant",
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: "stored answer" }],
+      };
+      const newUser = {
+        id: "pending-user",
+        role: "user" as const,
+        parts: [
+          { type: "text" as const, text: "new request" },
+          ...(localFiles
+            ? [
+                {
+                  type: "file" as const,
+                  mediaType: "text/plain",
+                  url: "",
+                  storage: "local-desktop",
+                  localAttachmentId: "fixture",
+                  localPath: "/fixtures/notes.txt",
+                },
+              ]
+            : []),
+        ],
+      };
+      mockQuery
+        .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+        .mockResolvedValueOnce({
+          page: [oldAssistant, oldUser],
+          isDone: true,
+          continueCursor: null,
+        });
+      const result = await getMessagesByChatId({
+        chatId: "chat-1",
+        userId: "user-1",
+        subscription: "pro",
+        mode: "ask",
+        regenerate: false,
+        newMessages: [
+          { ...oldUser, parts: [{ type: "text", text: "stale client copy" }] },
+          oldAssistant,
+          newUser,
+          newUser,
+        ],
+        useClientMessagesForRegenerate: true,
+      });
+      expect(result.truncatedMessages).toEqual([
+        oldUser,
+        oldAssistant,
+        newUser,
+      ]);
+    },
+  );
+
+  it("does not append client history older than the fetched page", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const message = (id: string) => ({
+      id,
+      role: "user" as const,
+      parts: [{ type: "text" as const, text: id }],
+    });
+    const older = message("older-client-row");
+    const stored = message("latest-stored-row");
+    const pending = message("pending-row");
+    mockQuery
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+      .mockResolvedValueOnce({
+        page: [stored],
+        isDone: true,
+        continueCursor: null,
+      });
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "pro",
+      mode: "ask",
+      regenerate: false,
+      newMessages: [older, stored, pending],
+    });
+    expect(result.truncatedMessages).toEqual([stored, pending]);
+  });
+
+  it("retries transient chat history page fetches before falling back", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const existingMessage = {
+      id: "existing-message-1",
+      role: "user" as const,
+      parts: [{ type: "text" as const, text: "previous prompt" }],
+    };
+    const newMessage = {
+      id: "new-message-1",
+      role: "user" as const,
+      parts: [{ type: "text" as const, text: "next prompt" }],
+    };
+    const convexError = new Error(
+      "InternalServerError: Your request couldn't be completed. Try again later",
+    );
+
+    mockQuery
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+      .mockRejectedValueOnce(convexError)
+      .mockResolvedValueOnce({
+        page: [existingMessage],
+        isDone: true,
+        continueCursor: null,
+      });
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const result = await getMessagesByChatId({
+        chatId: "chat-1",
+        userId: "user-1",
+        subscription: "free",
+        newMessages: [newMessage],
+        mode: "ask",
+      });
+
+      expect(result.truncatedMessages).toEqual([existingMessage, newMessage]);
+      expect(mockQuery).toHaveBeenCalledTimes(3);
+
+      const retryEvents = warnSpy.mock.calls
+        .map(([line]) => JSON.parse(String(line)))
+        .filter(
+          (payload) => payload.event === "chat_history_fetch_retry_scheduled",
+        );
+
+      expect(retryEvents).toHaveLength(1);
+      expect(retryEvents[0]).toMatchObject({
+        db_operation: "messages.getMessagesPageForBackend",
+        retry_reason: "convex_server_error",
+        attempt: 1,
+        next_attempt: 2,
+        retry_delay_ms: 0,
+        chat_id: "chat-1",
+        user_id: "user-1",
+        page_size: 24,
+        cursor_present: false,
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it.each(["ask", "agent"] as const)(
+    "recovers a terminated history response in %s without losing or duplicating pages",
+    async (mode) => {
+      const { getMessagesByChatId, mockQuery } =
+        await loadSaveMessageWithMocks();
+      const older = {
+        id: "older",
+        role: "user" as const,
+        parts: [{ type: "text" as const, text: "old" }],
+      };
+      const newer = {
+        id: "newer",
+        role: "user" as const,
+        parts: [{ type: "text" as const, text: "new" }],
+      };
+      mockQuery
+        .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+        .mockResolvedValueOnce({
+          page: [newer],
+          isDone: false,
+          continueCursor: "page-2",
+        })
+        .mockRejectedValueOnce(new TypeError("terminated"))
+        .mockResolvedValueOnce({
+          page: [older],
+          isDone: true,
+          continueCursor: null,
+        });
+      const result = await getMessagesByChatId({
+        chatId: "chat-1",
+        userId: "user-1",
+        subscription: "pro",
+        newMessages: [],
+        mode,
+      });
+      expect(result.truncatedMessages).toEqual([older, newer]);
+      expect(mockQuery).toHaveBeenCalledTimes(4);
+      expect(mockQuery.mock.calls[2][1]).toEqual(mockQuery.mock.calls[3][1]);
+    },
+  );
+
+  it("shares two retries across pages and error reasons, preserving terminal failure", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const message = {
+      id: "message",
+      role: "user" as const,
+      parts: [{ type: "text" as const, text: "old" }],
+    };
+    mockQuery
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+      .mockRejectedValueOnce(new Error("fetch failed"))
+      .mockResolvedValueOnce({
+        page: [message],
+        isDone: false,
+        continueCursor: "page-2",
+      })
+      .mockRejectedValueOnce(new TypeError("terminated"))
+      .mockResolvedValueOnce({
+        page: [],
+        isDone: false,
+        continueCursor: "page-3",
+      })
+      .mockRejectedValueOnce(new TypeError("terminated"));
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(
+        getMessagesByChatId({
+          chatId: "chat-1",
+          userId: "user-1",
+          subscription: "pro",
+          newMessages: [],
+          mode: "agent",
+        }),
+      ).rejects.toMatchObject({
+        type: "offline",
+        surface: "database",
+        metadata: expect.objectContaining({
+          db_retry_reason: "network_response_terminated",
+        }),
+      });
+      expect(mockQuery).toHaveBeenCalledTimes(6);
+      const retries = warnSpy.mock.calls
+        .map(([line]) => JSON.parse(String(line)))
+        .filter(
+          (event) => event.event === "chat_history_fetch_retry_scheduled",
+        );
+      expect(retries).toHaveLength(2);
+      expect(retries.map((event) => event.history_retry_count)).toEqual([1, 2]);
+      expect(errorSpy).toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    new Error("terminated"),
+    new TypeError("unrelated failure"),
+    Object.assign(new TypeError("terminated"), {
+      data: { code: "CHAT_UNAUTHORIZED" },
+    }),
+  ])(
+    "does not retry unrelated or structured history errors: %s",
+    async (failure) => {
+      const { getMessagesByChatId, mockQuery } =
+        await loadSaveMessageWithMocks();
+      mockQuery
+        .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+        .mockRejectedValue(failure);
+      await expect(
+        getMessagesByChatId({
+          chatId: "chat-1",
+          userId: "user-1",
+          subscription: "pro",
+          newMessages: [],
+          mode: "agent",
+        }),
+      ).rejects.toThrow();
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("completes four pages with two retries without renewing the budget", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const messages = [0, 1, 2, 3].map((i) => ({
+      id: `message-${i}`,
+      role: "user" as const,
+      parts: [{ type: "text" as const, text: `message ${i}` }],
+    }));
+    mockQuery
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+      .mockRejectedValueOnce(new TypeError("terminated"))
+      .mockResolvedValueOnce({
+        page: [messages[3]],
+        isDone: false,
+        continueCursor: "page-2",
+      })
+      .mockResolvedValueOnce({
+        page: [messages[2]],
+        isDone: false,
+        continueCursor: "page-3",
+      })
+      .mockResolvedValueOnce({
+        page: [messages[1]],
+        isDone: false,
+        continueCursor: "page-4",
+      })
+      .mockRejectedValueOnce(new Error("fetch failed"))
+      .mockResolvedValueOnce({
+        page: [messages[0]],
+        isDone: false,
+        continueCursor: "page-5",
+      });
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "pro",
+      newMessages: [],
+      mode: "agent",
+      regenerate: true,
+    });
+    expect(result.truncatedMessages).toEqual(messages);
+    expect(mockQuery).toHaveBeenCalledTimes(7);
+    expect(mockQuery.mock.calls[5][1]).toEqual(mockQuery.mock.calls[6][1]);
+  });
+
+  it.each([false, true])(
+    "exhausts repeated response terminations with client messages=%s",
+    async (hasClientMessages) => {
+      const { getMessagesByChatId, mockQuery } =
+        await loadSaveMessageWithMocks();
+      const messages = [
+        {
+          id: "new-message",
+          role: "user" as const,
+          parts: [{ type: "text" as const, text: "hello" }],
+        },
+      ];
+      mockQuery
+        .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+        .mockRejectedValue(new TypeError("terminated"));
+      const result = getMessagesByChatId({
+        chatId: "chat-1",
+        userId: "user-1",
+        subscription: "pro",
+        newMessages: hasClientMessages ? messages : [],
+        mode: "ask",
+      });
+      if (hasClientMessages) {
+        await expect(result).resolves.toMatchObject({
+          truncatedMessages: messages,
+        });
+      } else {
+        await expect(result).rejects.toMatchObject({
+          type: "offline",
+          surface: "database",
+        });
+      }
+      expect(mockQuery).toHaveBeenCalledTimes(4);
+    },
+  );
+
+  it("does not add terminated-response retries to writes", async () => {
+    const { saveMessage, mockMutation } = await loadSaveMessageWithMocks();
+    mockMutation.mockRejectedValue(new TypeError("terminated"));
+    await expect(
+      saveMessage({
+        chatId: "chat-1",
+        userId: "user-1",
+        message: {
+          id: "message-1",
+          role: "user",
+          parts: [{ type: "text", text: "hello" }],
+        },
+      }),
+    ).rejects.toThrow();
+    expect(mockMutation).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses file token metadata returned with existing history pages", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const fileId = "file-existing";
+    const existingMessage = {
+      id: "existing-message-with-file",
+      role: "user" as const,
+      parts: [{ type: "file" as const, fileId }],
+    };
+
+    mockQuery
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+      .mockResolvedValueOnce({
+        page: [existingMessage],
+        fileTokens: [{ fileId, tokenSize: 321 }],
+        isDone: true,
+        continueCursor: null,
+      });
+
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "pro",
+      newMessages: [],
+      mode: "ask",
+    });
+
+    expect(result.truncatedMessages).toEqual([existingMessage]);
+    expect(result.fileTokens).toEqual({ [fileId]: 321 });
+    expect(mockQuery).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores returned file token metadata in agent mode", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const fileId = "file-from-ask-mode";
+    const existingMessage = {
+      id: "existing-message-with-file",
+      role: "user" as const,
+      parts: [{ type: "file" as const, fileId }],
+    };
+
+    mockQuery
+      .mockResolvedValueOnce({ id: "chat-1", user_id: "user-1" })
+      .mockResolvedValueOnce({
+        page: [existingMessage],
+        fileTokens: [{ fileId, tokenSize: 200_001 }],
+        isDone: true,
+        continueCursor: null,
+      });
+
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "pro",
+      newMessages: [],
+      mode: "agent",
+    });
+
+    expect(result.truncatedMessages).toEqual([existingMessage]);
+    expect(result.fileTokens).toEqual({});
+    expect(mockQuery).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not inject a stored summary while regenerating", async () => {
+    const { getMessagesByChatId, mockQuery } = await loadSaveMessageWithMocks();
+    const lastUserMessage = {
+      id: "user-message-1",
+      role: "user" as const,
+      parts: [{ type: "text" as const, text: "do recon on hackerai.co" }],
+    };
+
+    mockQuery
+      .mockResolvedValueOnce({
+        id: "chat-1",
+        user_id: "user-1",
+        latest_summary_id: "summary-1",
+      })
+      .mockResolvedValueOnce({
+        page: [lastUserMessage],
+        isDone: true,
+        continueCursor: "",
+      });
+
+    const result = await getMessagesByChatId({
+      chatId: "chat-1",
+      userId: "user-1",
+      subscription: "pro",
+      newMessages: [],
+      regenerate: true,
+      mode: "agent",
+    });
+
+    expect(result.truncatedMessages).toEqual([lastUserMessage]);
+    expect(JSON.stringify(result.truncatedMessages)).not.toContain(
+      "context_summary",
+    );
+    expect(mockQuery).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("deleteChatForBackend", () => {
+  it("retries generic Convex server errors before deleting a chat", async () => {
+    const { deleteChatForBackend, mockMutation } =
+      await loadSaveMessageWithMocks();
+    const convexError = new Error("[Request ID: abc] Server Error");
+    mockMutation
+      .mockRejectedValueOnce(convexError as never)
+      .mockResolvedValueOnce({ deleted: true } as never);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      await expect(
+        deleteChatForBackend({
+          chatId: "chat-1",
+          userId: "user-1",
+          expectedTriggerRunId: null,
+          expectedApprovalSessionId: null,
+        }),
+      ).resolves.toEqual({ deleted: true });
+
+      expect(mockMutation).toHaveBeenCalledTimes(2);
+      const retryEvents = warnSpy.mock.calls
+        .map(([line]) => JSON.parse(String(line)))
+        .filter((payload) => payload.event === "chat_deletion_retry_scheduled");
+      expect(retryEvents).toEqual([
+        expect.objectContaining({
+          db_operation: "chats.deleteChatForBackend",
+          retry_reason: "convex_server_error",
+          attempt: 1,
+          next_attempt: 2,
+          retry_delay_ms: 0,
+          chat_id: "chat-1",
+          user_id: "user-1",
+        }),
+      ]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("classifies Convex access denials as warnings and forbidden chat errors", async () => {
+    const { deleteChatForBackend, mockMutation } =
+      await loadSaveMessageWithMocks();
+    const convexError = new Error("[Request ID: abc] Server Error") as Error & {
+      data?: unknown;
+    };
+    convexError.name = "ConvexError";
+    convexError.data = {
+      code: "ACCESS_DENIED",
+      message: "Unauthorized: Chat does not belong to user",
+    };
+    mockMutation.mockRejectedValueOnce(convexError as never);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await expect(
+        deleteChatForBackend({
+          chatId: "chat-1",
+          userId: "user-1",
+          expectedTriggerRunId: "run-1",
+          expectedApprovalSessionId: "approval-session-1",
+        }),
+      ).rejects.toMatchObject({
+        type: "forbidden",
+        surface: "chat",
+        statusCode: 403,
+        metadata: expect.objectContaining({
+          db_operation: "chats.deleteChatForBackend",
+          db_error_code: "ACCESS_DENIED",
+        }),
+      });
+
+      const warnEvents = warnSpy.mock.calls.map(([line]) => {
+        const payload = JSON.parse(String(line));
+        return payload.event;
+      });
+      expect(mockMutation).toHaveBeenCalledTimes(1);
+      expect(warnEvents).toContain("chat_access_denied");
+      expect(warnEvents).not.toContain("chat_deletion_retry_scheduled");
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+});
+
+describe("deleteAllChatsForBackend", () => {
+  it("retries Convex optimistic concurrency conflicts", async () => {
+    const { deleteAllChatsForBackend, mockMutation } =
+      await loadSaveMessageWithMocks();
+    const convexError = new Error(
+      JSON.stringify({
+        code: "OptimisticConcurrencyControlFailure",
+        message: "Documents changed while this mutation was being run",
+      }),
+    );
+    mockMutation
+      .mockRejectedValueOnce(convexError as never)
+      .mockResolvedValueOnce(undefined as never);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      await expect(
+        deleteAllChatsForBackend({ userId: "user-1" }),
+      ).resolves.toBeUndefined();
+
+      expect(mockMutation).toHaveBeenCalledTimes(2);
+      const retryEvents = warnSpy.mock.calls
+        .map(([line]) => JSON.parse(String(line)))
+        .filter((payload) => payload.event === "chat_deletion_retry_scheduled");
+      expect(retryEvents).toEqual([
+        expect.objectContaining({
+          db_operation: "chats.deleteAllChatsForBackend",
+          retry_reason: "optimistic_concurrency_conflict",
+          attempt: 1,
+          next_attempt: 2,
+          retry_delay_ms: 0,
+          user_id: "user-1",
+        }),
+      ]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("classifies an exhausted optimistic concurrency retry as transient", async () => {
+    const { deleteAllChatsForBackend, mockMutation } =
+      await loadSaveMessageWithMocks();
+    const convexError = new Error(
+      JSON.stringify({
+        code: "OptimisticConcurrencyControlFailure",
+        message: "Documents changed while this mutation was being run",
+      }),
+    );
+    mockMutation.mockRejectedValue(convexError as never);
+
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await expect(
+        deleteAllChatsForBackend({ userId: "user-1" }),
+      ).rejects.toMatchObject({
+        type: "offline",
+        surface: "database",
+        statusCode: 503,
+        metadata: expect.objectContaining({
+          db_operation: "chats.deleteAllChatsForBackend",
+          db_retry_reason: "optimistic_concurrency_conflict",
+        }),
+      });
+
+      expect(mockMutation).toHaveBeenCalledTimes(3);
+      const retryEvents = warnSpy.mock.calls
+        .map(([line]) => JSON.parse(String(line)))
+        .filter((payload) => payload.event === "chat_deletion_retry_scheduled");
+      expect(retryEvents).toEqual([
+        expect.objectContaining({ attempt: 1, next_attempt: 2 }),
+        expect.objectContaining({ attempt: 2, next_attempt: 3 }),
+      ]);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+});
+
+it("persists server routing markers alongside usage only for assistant messages", async () => {
+  const { saveMessage, mockMutation } = await loadSaveMessageWithMocks();
+  const marker = {
+    version: 1 as const,
+    source: "moderation" as const,
+    completed: true,
+  };
+  for (const role of ["assistant", "user"] as const) {
+    await saveMessage({
+      chatId: "chat",
+      userId: "user",
+      message: { id: role, role, parts: [{ type: "text", text: "ok" }] },
+      usage: { inputTokens: 12 },
+      abliterationRouting: marker,
+    });
+  }
+  expect(mockMutation.mock.calls[0][1].usage).toEqual({
+    inputTokens: 12,
+    abliterationRouting: marker,
+  });
+  expect(mockMutation.mock.calls[1][1].usage).toEqual({ inputTokens: 12 });
+});
+
+describe("initial chat persistence diagnostics", () => {
+  const messages = [
+    {
+      id: "message-1",
+      parts: [{ type: "text" as const, text: "private-canary" }],
+    },
+  ];
+
+  it.each([
+    ["save_chat", null, false, "chats:saveChat"],
+    [
+      "reset_stream",
+      { user_id: "user-1" },
+      true,
+      "chatStreams:prepareForNewStream",
+    ],
+    ["save_user_message", { user_id: "user-1" }, false, "messages:saveMessage"],
+  ] as const)(
+    "reports %s while that persistence operation is still waiting",
+    async (step, chat, regenerate, operation) => {
+      const { handleInitialChatAndUserMessage, mockMutation } =
+        await loadSaveMessageWithMocks();
+      let finish!: (value: any) => void;
+      mockMutation.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      );
+      const onPersistenceStep = jest.fn();
+      let settled = false;
+      const pending = handleInitialChatAndUserMessage({
+        chatId: "chat-1",
+        userId: "user-1",
+        messages,
+        chat,
+        regenerate,
+        onPersistenceStep,
+      }).then(() => {
+        settled = true;
+      });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      expect(onPersistenceStep.mock.calls).toEqual([[step]]);
+      const { getFunctionName } = await import("convex/server");
+      expect(getFunctionName(mockMutation.mock.calls[0]![0] as any)).toBe(
+        operation,
+      );
+      finish({ id: "message-1" });
+      await pending;
+      expect(settled).toBe(true);
+    },
+  );
+
+  it("persists the selected environment with the first task write", async () => {
+    const { handleInitialChatAndUserMessage, mockMutation } =
+      await loadSaveMessageWithMocks();
+    await handleInitialChatAndUserMessage({
+      chatId: "chat-1",
+      userId: "user-1",
+      messages,
+      chat: null,
+      sandboxType: "desktop",
+    });
+    expect(mockMutation.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ sandboxType: "desktop" }),
+    );
+  });
+
+  it("persists the chat and message in order even if diagnostic reporting throws", async () => {
+    const { handleInitialChatAndUserMessage, mockMutation } =
+      await loadSaveMessageWithMocks();
+    await expect(
+      handleInitialChatAndUserMessage({
+        chatId: "chat-1",
+        userId: "user-1",
+        messages,
+        chat: null,
+        onPersistenceStep: () => {
+          throw new Error("diagnostic unavailable");
+        },
+      }),
+    ).resolves.toBeUndefined();
+    const { getFunctionName } = await import("convex/server");
+    expect(
+      mockMutation.mock.calls.map(([fn]) => getFunctionName(fn as any)),
+    ).toEqual(["chats:saveChat", "messages:saveMessage"]);
+  });
+});
+
+describe("regenerated chat initialization", () => {
+  const args = {
+    chatId: "chat-1",
+    userId: "user-1",
+    messages: [
+      {
+        id: "user-message-1",
+        parts: [
+          { type: "text" as const, text: "Retest the synthetic finding" },
+        ],
+      },
+    ],
+    regenerate: true,
+    chat: { user_id: "user-1", canceled_at: 123 },
+  };
+
+  it("awaits cancellation cleanup without inserting another user message", async () => {
+    const { handleInitialChatAndUserMessage, mockMutation } =
+      await loadSaveMessageWithMocks();
+    let completeCleanup!: (value: null) => void;
+    mockMutation.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          completeCleanup = resolve;
+        }),
+    );
+    let ready = false;
+    const initialization = handleInitialChatAndUserMessage(args).then(() => {
+      ready = true;
+    });
+    await Promise.resolve();
+    expect(ready).toBe(false);
+    expect(mockMutation).toHaveBeenCalledTimes(1);
+    expect(mockMutation.mock.calls[0]?.[1]).toEqual({
+      serviceKey: undefined,
+      chatId: "chat-1",
+    });
+    completeCleanup(null);
+    await initialization;
+    expect(ready).toBe(true);
+    expect(mockMutation).toHaveBeenCalledTimes(1);
+    const { getFunctionName } = await import("convex/server");
+    expect(getFunctionName(mockMutation.mock.calls[0]![0] as any)).toBe(
+      "chatStreams:prepareForNewStream",
+    );
+  });
+
+  it("does not clear another owner's cancellation state", async () => {
+    const { handleInitialChatAndUserMessage, mockMutation } =
+      await loadSaveMessageWithMocks();
+    const onPersistenceStep = jest.fn();
+    await expect(
+      handleInitialChatAndUserMessage({
+        ...args,
+        userId: "other-user",
+        onPersistenceStep,
+      }),
+    ).rejects.toThrow();
+    expect(mockMutation).not.toHaveBeenCalled();
+    expect(onPersistenceStep).not.toHaveBeenCalled();
+  });
+
+  it("stops initialization when cancellation cleanup fails", async () => {
+    const { handleInitialChatAndUserMessage, mockMutation } =
+      await loadSaveMessageWithMocks();
+    mockMutation.mockRejectedValue(new Error("Unavailable"));
+    await expect(handleInitialChatAndUserMessage(args)).rejects.toThrow();
+    expect(mockMutation).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("saveMessage cancellation", () => {
+  it("aborts a retry wait before a second mutation is sent", async () => {
+    const { saveMessage, mockMutation } = await loadSaveMessageWithMocks();
+    jest.useFakeTimers();
+    const controller = new AbortController();
+    mockMutation.mockRejectedValue(new TypeError("fetch failed") as never);
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const error = jest.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const pending = saveMessage({
+        chatId: "chat",
+        userId: "owner",
+        message: {
+          id: "assistant",
+          role: "assistant",
+          parts: [{ type: "text", text: "progress" }],
+        },
+        signal: controller.signal,
+      });
+      const rejected = expect(pending).rejects.toBeDefined();
+      for (let i = 0; i < 20 && warn.mock.calls.length === 0; i++)
+        await Promise.resolve();
+      expect(warn).toHaveBeenCalled();
+      controller.abort(new Error("fixture deadline"));
+      await rejected;
+      await jest.runOnlyPendingTimersAsync();
+      expect(mockMutation).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+      error.mockRestore();
+      jest.useRealTimers();
+    }
+  });
+});
