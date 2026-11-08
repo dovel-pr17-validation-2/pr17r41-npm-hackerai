@@ -346,7 +346,7 @@ jobs:
           find packages/desktop/src-tauri/target/${{ matrix.target }}/release/bundle -type f 2>/dev/null || true
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: desktop-${{ matrix.name }}
           path: |
@@ -504,7 +504,7 @@ jobs:
             "$PWD/HackerAI-universal.dmg" "$PWD/universal-notary-recovery.tar.gz"
 
       - name: Upload notarization recovery artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: notarization-recovery-universal-attempt-${{ github.run_attempt }}
           path: universal-notary-recovery.tar.gz
@@ -521,7 +521,7 @@ jobs:
             "$PWD/HackerAI-universal.dmg" "$RUNNER_TEMP/universal-dmg-notary.txt"
 
       - name: Upload universal artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: desktop-macOS-universal
           path: HackerAI-universal.dmg
